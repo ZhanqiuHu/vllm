@@ -743,6 +743,21 @@ class NixlConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
+            # [PoC] Mamba P/D: P only prefilled N-1 tokens so that
+            # D receives h(N-1) and recomputes the last prompt token.
+            if self._is_hma_required and count > 1:
+                count -= 1
+                assert count == len(token_ids) - 1, (
+                    f"[MAMBA-POC] D should expect N-1 tokens! "
+                    f"count={count}, prompt_len={len(token_ids)}"
+                )
+                logger.info(
+                    "[MAMBA-POC] D-side get_num_new_matched_tokens: "
+                    "prompt_len=%d, returning count=%d == N-1=%d ✓",
+                    len(token_ids),
+                    count,
+                    len(token_ids) - 1,
+                )
             if count > 0:
                 return count, True
 
