@@ -168,9 +168,9 @@ async def send_request_to_service(
         "remote_port": None,
     }
     req_data["stream"] = False
-    req_data["max_tokens"] = 1
+    req_data["max_tokens"] = 0
     if "max_completion_tokens" in req_data:
-        req_data["max_completion_tokens"] = 1
+        req_data["max_completion_tokens"] = 0
     if "stream_options" in req_data:
         del req_data["stream_options"]
     headers = {
