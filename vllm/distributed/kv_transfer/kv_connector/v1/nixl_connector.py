@@ -513,6 +513,7 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
+        self.connector_worker.log_mamba_send_checksums(self._connector_metadata)
 
     def shutdown(self):
         if self.connector_worker is not None:
@@ -940,6 +941,17 @@ class NixlConnectorScheduler:
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clipped_blocks(block_ids)
+
+        if self._is_hma_required and delay_free_blocks:
+            logger.info(
+                "[MAMBA-P-FINISHED] req=%s prompt_len=%d "
+                "computed=%d num_groups=%d block_ids_per_group=%s",
+                request.request_id[:8],
+                request.num_prompt_tokens,
+                request.num_computed_tokens,
+                len(block_ids),
+                [len(b) for b in block_ids],
+            )
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -1669,10 +1681,16 @@ class NixlConnectorWorker:
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
         if self._has_mamba:
+            mamba_spec = next(
+                spec
+                for spec in self._layer_specs.values()
+                if isinstance(spec, MambaSpec)
+            )
             logger.info(
                 "Hybrid SSM registration: num_blocks=%s, "
                 "logical_num_blocks=%s, ratio=%s, num_regions=%s, "
-                "num_descs=%s, mamba_ssm_size=%s, block_len_per_layer=%s",
+                "num_descs=%s, mamba_ssm_size=%s, block_len_per_layer=%s, "
+                "mamba_block_size=%s, mamba_cache_mode=%s",
                 self.num_blocks,
                 self._logical_num_blocks,
                 self._physical_blocks_per_logical_kv_block,
@@ -1680,6 +1698,8 @@ class NixlConnectorWorker:
                 self.num_descs,
                 self._mamba_ssm_size,
                 set(self.block_len_per_layer),
+                mamba_spec.block_size,
+                mamba_spec.mamba_cache_mode,
             )
 
         # Register local/src descr for NIXL xfer.
@@ -2163,6 +2183,36 @@ class NixlConnectorWorker:
                     "d2h",
                 )
 
+    def log_mamba_send_checksums(self, metadata: NixlConnectorMetadata):
+        """Log checksums of P-side Mamba state after forward pass."""
+        if not self._has_mamba:
+            return
+        try:
+            for req_id, meta in metadata.reqs_to_save.items():
+                for gi, is_mamba in enumerate(self._is_mamba_group):
+                    if not is_mamba:
+                        continue
+                    blk_ids = meta.local_block_ids[gi]
+                    if not blk_ids:
+                        continue
+                    _ln = self.kv_cache_config.kv_cache_groups[gi].layer_names[0]
+                    _kv = self.device_kv_caches.get(_ln)
+                    if _kv and isinstance(_kv, list):
+                        _blk = blk_ids[0]
+                        _sums = [f"{s[_blk].float().sum().item():.2f}" for s in _kv]
+                        logger.info(
+                            "[MAMBA-CHECKSUM-SEND] req=%s "
+                            "rank=%d blk=%d layer=%s "
+                            "sums=[%s]",
+                            req_id[:8],
+                            self.tp_rank,
+                            _blk,
+                            _ln,
+                            ", ".join(_sums),
+                        )
+        except Exception:
+            logger.debug("MAMBA-CHECKSUM-SEND failed", exc_info=True)
+
     def post_process_device_kv_on_receive(
         self,
         block_size_ratio: int,
@@ -2250,6 +2300,32 @@ class NixlConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
             assert meta.remote is not None
+
+            if self._has_mamba:
+                for gi, is_mamba in enumerate(self._is_mamba_group):
+                    if is_mamba:
+                        local_blks = meta.local_physical_block_ids[gi]
+                        remote_blks = (
+                            meta.remote.block_ids[gi] if meta.remote.block_ids else []
+                        )
+                        import time as _time
+
+                        _recv_t = _time.monotonic()
+                        logger.info(
+                            "[MAMBA-RECV-DONE] req=%s rank=%d "
+                            "group=%d local_mamba_blks=%s "
+                            "remote_mamba_blks=%s ssm_sizes=%s "
+                            "t=%.6f",
+                            req_id[:8],
+                            self.tp_rank,
+                            gi,
+                            local_blks,
+                            remote_blks,
+                            self._mamba_ssm_size,
+                            _recv_t,
+                        )
+                        break
+
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
 

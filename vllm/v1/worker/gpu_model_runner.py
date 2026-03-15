@@ -3761,6 +3761,12 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        if self.kv_cache_config is not None and any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in self.kv_cache_config.kv_cache_groups
+        ):
+            torch.cuda.synchronize()
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization

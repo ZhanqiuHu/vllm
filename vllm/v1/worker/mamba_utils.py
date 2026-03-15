@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -18,6 +19,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -175,6 +178,7 @@ def preprocess_mamba(
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
+        is_new = prev_state_idx is None
         if prev_state_idx is None:
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
@@ -198,6 +202,37 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
+        if is_new or prev_state_idx != curr_state_idx:
+            logger.info(
+                "[MAMBA-PREPROCESS] req=%s new=%s computed=%d "
+                "scheduled=%d block_size=%d prev_idx=%d curr_idx=%d "
+                "num_blocks=%d will_copy=%s",
+                req_id[:8],
+                is_new,
+                req_state.num_computed_tokens,
+                num_scheduled_tokens,
+                block_size,
+                prev_state_idx,
+                curr_state_idx,
+                num_blocks,
+                prev_state_idx != -1 and prev_state_idx != curr_state_idx,
+            )
+        if is_new and req_state.num_computed_tokens > 0:
+            _gid = mamba_group_ids[0]
+            _bids = req_state.block_ids[_gid]
+            if _bids and 0 <= prev_state_idx < len(_bids):
+                _blk = _bids[prev_state_idx]
+                _ln = kv_cache_config.kv_cache_groups[_gid].layer_names[0]
+                _caches = forward_context[_ln].kv_cache[0]
+                _sums = [f"{s[_blk].float().sum().item():.2f}" for s in _caches]
+                logger.info(
+                    "[MAMBA-CHECKSUM-PRE] req=%s computed=%d blk=%d layer=%s sums=[%s]",
+                    req_id[:8],
+                    req_state.num_computed_tokens,
+                    _blk,
+                    _ln,
+                    ", ".join(_sums),
+                )
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
