@@ -396,6 +396,57 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+
+            # [PoC] Mamba P/D: cap RUNNING loop to N-1 total tokens.
+            # The batch queue or token-budget chunking may cause multiple
+            # RUNNING passes; each must respect the N-1 ceiling.
+            _is_mamba_p_side_running = (
+                self.has_mamba_layers
+                and request.sampling_params is not None
+                and request.sampling_params.max_tokens == 0
+                and request.kv_transfer_params is not None
+                and request.kv_transfer_params.get("do_remote_decode")
+            )
+            if _is_mamba_p_side_running:
+                max_computed = request.num_prompt_tokens - 1
+                remaining = max_computed - request.num_computed_tokens
+                num_new_tokens = 0 if remaining <= 0 else min(num_new_tokens, remaining)
+                logger.info(
+                    "[MAMBA-POC] P-side RUNNING cap: req=%s, "
+                    "computed=%d, N-1=%d, remaining=%d, "
+                    "num_new_tokens=%d",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    max_computed,
+                    max(remaining, 0),
+                    num_new_tokens,
+                )
+
+            # [MAMBA-POC] Log when D schedules the last prompt token
+            # after KV transfer (the critical recompute step).
+            if (
+                self.has_mamba_layers
+                and request.is_prefill_chunk
+                and request.kv_transfer_params is not None
+                and request.kv_transfer_params.get("do_remote_prefill")
+                and request.num_computed_tokens > 0
+            ):
+                logger.info(
+                    "[MAMBA-POC] D-side scheduling recompute: "
+                    "req=%s, computed=%d, num_tokens=%d, "
+                    "num_new_tokens=%d (should be 1), "
+                    "is_prefill_chunk=%s",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                    num_new_tokens,
+                    request.is_prefill_chunk,
+                )
+                assert num_new_tokens == 1, (
+                    f"[MAMBA-POC] D should recompute exactly 1 token! "
+                    f"got {num_new_tokens}"
+                )
+
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -653,6 +704,43 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+
+                    # [PoC] Mamba P/D: prefill only N-1 tokens so that
+                    # the transferred Mamba state is h(N-1), which is the
+                    # correct initial state for D's "recompute last token."
+                    _is_mamba_p_side = (
+                        self.has_mamba_layers
+                        and request.sampling_params is not None
+                        and request.sampling_params.max_tokens == 0
+                        and request.kv_transfer_params is not None
+                        and request.kv_transfer_params.get("do_remote_decode")
+                    )
+                    if _is_mamba_p_side:
+                        max_prefill = (
+                            request.num_prompt_tokens - 1 - num_computed_tokens
+                        )
+                        old_num = num_new_tokens
+                        num_new_tokens = min(num_new_tokens, max(max_prefill, 0))
+                        assert (
+                            num_computed_tokens + num_new_tokens
+                            <= request.num_prompt_tokens - 1
+                        ), (
+                            f"[MAMBA-POC] P must not prefill past N-1! "
+                            f"computed={num_computed_tokens}, "
+                            f"new={num_new_tokens}, "
+                            f"prompt_len={request.num_prompt_tokens}"
+                        )
+                        logger.info(
+                            "[MAMBA-POC] P-side cap: prompt_len=%d, "
+                            "computed=%d, num_new_tokens %d -> %d "
+                            "(target=%d)",
+                            request.num_prompt_tokens,
+                            num_computed_tokens,
+                            old_num,
+                            num_new_tokens,
+                            request.num_prompt_tokens - 1,
+                        )
+
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -1378,6 +1466,33 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # [PoC] Mamba P/D: force-finish P after N-1 prefill tokens.
+            # P has h(N-1) in the blocks — exactly what D needs.
+            if (
+                not stopped
+                and self.has_mamba_layers
+                and request.sampling_params is not None
+                and request.sampling_params.max_tokens == 0
+                and request.kv_transfer_params is not None
+                and request.kv_transfer_params.get("do_remote_decode")
+                and request.num_computed_tokens >= request.num_prompt_tokens - 1
+            ):
+                assert request.num_computed_tokens == request.num_prompt_tokens - 1, (
+                    f"[MAMBA-POC] P should have exactly N-1 tokens! "
+                    f"computed={request.num_computed_tokens}, "
+                    f"prompt_len={request.num_prompt_tokens}"
+                )
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                stopped = True
+                logger.info(
+                    "[MAMBA-POC] P-side force-finish: req=%s, "
+                    "computed=%d == prompt_len-1=%d ✓, "
+                    "Mamba state is h(N-1)",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_prompt_tokens - 1,
+                )
+
             routed_experts = None
             finish_reason = None
             if stopped:
@@ -2038,7 +2153,40 @@ class Scheduler(SchedulerInterface):
 
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
-            if request.num_computed_tokens == request.num_tokens:
+            will_decrement = request.num_computed_tokens == request.num_tokens
+            if self.has_mamba_layers:
+                assert not will_decrement, (
+                    f"[MAMBA-POC] D should NOT decrement for Mamba! "
+                    f"computed={request.num_computed_tokens} should be "
+                    f"num_tokens-1={request.num_tokens - 1}, not "
+                    f"num_tokens={request.num_tokens}. "
+                    f"This means P transferred N tokens instead of N-1!"
+                )
+                assert request.num_computed_tokens == request.num_tokens - 1, (
+                    f"[MAMBA-POC] D should have exactly N-1 tokens "
+                    f"from P! computed={request.num_computed_tokens}, "
+                    f"expected={request.num_tokens - 1}"
+                )
+                logger.info(
+                    "[MAMBA-POC] D-side KV transfer done: req=%s, "
+                    "computed=%d == num_tokens-1=%d ✓, "
+                    "will_decrement=False, "
+                    "D will recompute last prompt token with h(N-1)",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_tokens - 1,
+                )
+            else:
+                logger.info(
+                    "[MAMBA-POC] D-side _update_waiting_for_remote_kv: "
+                    "req=%s, computed=%d, num_tokens=%d, "
+                    "will_decrement=%s",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                    will_decrement,
+                )
+            if will_decrement:
                 request.num_computed_tokens = request.num_tokens - 1
 
             # Count the number of prefix cached tokens.
