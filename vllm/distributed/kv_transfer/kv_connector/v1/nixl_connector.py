@@ -747,8 +747,24 @@ class NixlConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
+            # HMA (Mamba/SSM): P only prefilled N-1 tokens so that D
+            # receives h(N-1) and recomputes the last prompt token.
+            if self._is_hma_required and count > 1:
+                count -= 1
             if count > 0:
                 return count, True
+
+        # HMA P-side (do_remote_decode): truncate prompt to N-1 tokens so
+        # the model computes h(N-1) and stops via max_tokens after one
+        # decode sample (which does NOT update Mamba state).
+        if (self._is_hma_required
+                and params is not None
+                and params.get("do_remote_decode")):
+            if request.prompt_token_ids and len(request.prompt_token_ids) > 1:
+                request.prompt_token_ids.pop()
+                request._all_token_ids.pop()
+                request.num_prompt_tokens -= 1
+                request.max_tokens = 1
 
         # No remote prefill for this request.
         return 0, False
