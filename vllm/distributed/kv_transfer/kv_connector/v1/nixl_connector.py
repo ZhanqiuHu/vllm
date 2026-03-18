@@ -166,7 +166,6 @@ class NixlAgentMetadata:
     kv_cache_layout: str
     block_size: int
     ssm_sizes: tuple[int, int]
-    conv_shadow_base_addr: list[int] = msgspec.field(default_factory=list)
 
 
 @dataclass
@@ -1161,9 +1160,6 @@ class NixlConnectorWorker:
         # Map of engine_id -> num_descs (attention-only descriptor count).
         self._registered_descs: list[Any] = []
 
-        # Option D: P-side shadow buffers for chunk-interleaved transposed
-        # conv state so D can read its shard using simple rank_offset.
-        self._mamba_conv_shadow_bufs: list[torch.Tensor] = []
         # Chunk-interleave permutation indices (model-constant, TP-agnostic).
         # Forward: original flat → chunk-interleaved transposed flat.
         # Inverse: chunk-interleaved transposed → original (D-side).
@@ -1738,7 +1734,6 @@ class NixlConnectorWorker:
                 len(self._mamba_conv_caches),
                 [c.shape for c in self._mamba_conv_caches],
             )
-
         # Option D: build chunk-interleave permutation indices.
         # Forward perm (P-side): original → chunk-interleaved transposed.
         # Inverse perm (D-side): chunk-interleaved transposed → original shard.
@@ -1774,58 +1769,12 @@ class NixlConnectorWorker:
                 len(self._mamba_chunk_perm_inv),
             )
 
-        # Option D: allocate P-side shadow buffers for permuted conv state.
-        # These mirror the conv caches but will hold chunk-interleaved data.
-        # TODO: skip allocation on D-side (saves memory) once role is known.
-        self._mamba_conv_shadow_bufs = []
-        if self._has_mamba:
-            device_t = torch.device(f"cuda:{self.device_id}")
-            for conv_cache in self._mamba_conv_caches:
-                shadow = torch.empty_like(conv_cache, device=device_t)
-                self._mamba_conv_shadow_bufs.append(shadow)
-                reg_data = [
-                    (
-                        shadow.data_ptr(),
-                        shadow.nelement() * shadow.element_size(),
-                        self.device_id,
-                        "",
-                    )
-                ]
-                reg_descs = self.nixl_wrapper.get_reg_descs(
-                    reg_data, self.nixl_memory_type
-                )
-                self.nixl_wrapper.register_memory(
-                    reg_descs, backends=self.nixl_backends
-                )
-                self._registered_descs.append(reg_descs)
-            total_shadow = sum(
-                s.nelement() * s.element_size() for s in self._mamba_conv_shadow_bufs
-            )
-            logger.info(
-                "Allocated %d mamba conv shadow buffers (%.2f MiB total)",
-                len(self._mamba_conv_shadow_bufs),
-                total_shadow / (1024**2),
-            )
-
         # Register local/src descr for NIXL xfer.
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
             self.register_local_xfer_handler(self.block_size)
         )
 
         # After KV Caches registered, listen for new connections.
-        # Build shadow address list: one per kv_caches_base_addr entry.
-        # Non-zero for Mamba conv regions, 0 for attention regions.
-        conv_shadow_addrs: list[int] = []
-        if self._mamba_conv_shadow_bufs:
-            base_addrs = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-            conv_shadow_addrs = [0] * len(base_addrs)
-            mamba_addrs = {c.data_ptr() for c in self._mamba_conv_caches}
-            shadow_iter = iter(self._mamba_conv_shadow_bufs)
-            for idx, base_addr in enumerate(base_addrs):
-                if base_addr in mamba_addrs:
-                    shadow = next(shadow_iter)
-                    conv_shadow_addrs[idx] = shadow.data_ptr()
-
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1838,7 +1787,6 @@ class NixlConnectorWorker:
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self._mamba_ssm_size,
-            conv_shadow_base_addr=conv_shadow_addrs,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -2048,11 +1996,11 @@ class NixlConnectorWorker:
                     in_pos += 1
         return inv_perm
 
-    def _chunk_transpose_to_shadow(
+    def _chunk_transpose_inplace(
         self,
         block_ids: tuple[list[int], ...],
     ):
-        """Chunk-interleave + transpose conv blocks: cache → shadow (P).
+        """Chunk-interleave + transpose conv blocks in-place (P).
 
         Per block, vectorized GPU gather:
           conv_cache[blk]        shape (conv_rows, conv_dim)
@@ -2060,13 +2008,16 @@ class NixlConnectorWorker:
           flat                   shape (conv_rows * conv_dim,)
               ↓ perm_fwd[:]      gather by precomputed indices
           permuted               shape (conv_rows * conv_dim,)
-              ↓ reshape + write
-          shadow[blk]            shape (conv_rows, conv_dim)
+              ↓ reshape + write back
+          conv_cache[blk]        shape (conv_rows, conv_dim)
 
-        After this, shadow memory is laid out as:
+        After this, conv_cache memory for these blocks is laid out as:
           | chunk_0 | chunk_1 | ... | chunk_{g-1} |
         where each chunk is (x_r + 2*b_r) transposed columns.
         D rank j reads bytes [j*shard_bytes : (j+1)*shard_bytes].
+
+        Safe because blocks are freed after transfer and overwritten on
+        reuse; prefix caching is not supported for SSM-FA KV transfer.
         """
         if self._mamba_chunk_perm_fwd is None:
             return
@@ -2084,13 +2035,11 @@ class NixlConnectorWorker:
             device=f"cuda:{self.device_id}",
         )
 
-        for conv_cache, shadow in zip(
-            self._mamba_conv_caches, self._mamba_conv_shadow_bufs
-        ):
+        for ci, conv_cache in enumerate(self._mamba_conv_caches):
             selected = conv_cache.index_select(0, block_ids_t)
             flat = selected.reshape(selected.shape[0], -1)
             permuted = flat[:, self._mamba_chunk_perm_fwd]
-            shadow.index_copy_(0, block_ids_t, permuted.reshape(selected.shape))
+            conv_cache[block_ids_t] = permuted.reshape(selected.shape)
 
     def _unchunk_transpose_conv_inplace(
         self,
@@ -2120,7 +2069,7 @@ class NixlConnectorWorker:
             device=f"cuda:{self.device_id}",
         )
 
-        for conv_cache in self._mamba_conv_caches:
+        for ci, conv_cache in enumerate(self._mamba_conv_caches):
             selected = conv_cache.index_select(0, block_ids_t)
             flat = selected.reshape(selected.shape[0], -1)
             restored = flat[:, self._mamba_chunk_perm_inv]
@@ -2294,30 +2243,12 @@ class NixlConnectorWorker:
                 page_size = nixl_agent_meta.block_lens[i] * (
                     1 if not mamba else self._physical_blocks_per_logical_kv_block
                 )
-                shadow_addr = (
-                    nixl_agent_meta.conv_shadow_base_addr[i]
-                    if nixl_agent_meta.conv_shadow_base_addr
-                    else 0
-                )
-                if mamba and indexes_into_remote and shadow_addr:
-                    # Option D: P has permuted conv in shadow buffer.
-                    # Layout per block: [shard_0 | shard_1 | ...]
-                    # Each shard is contiguous → use standard rank_offset.
-                    p_conv_bytes = local_block_len * tp_ratio
-                    for block_id in range(num_blocks):
-                        addr = shadow_addr + block_id * p_conv_bytes + rank_offset
-                        blocks_data.append(
-                            (addr, local_block_len, nixl_agent_meta.device_id)
-                        )
-                else:
-                    conv_rank_offset = rank_offset
-                    conv_block_len = local_block_len
-                    for block_id in range(num_blocks):
-                        block_offset = block_id * page_size
-                        addr = base_addr + block_offset + conv_rank_offset
-                        blocks_data.append(
-                            (addr, conv_block_len, nixl_agent_meta.device_id)
-                        )
+                for block_id in range(num_blocks):
+                    block_offset = block_id * page_size
+                    addr = base_addr + block_offset + rank_offset
+                    blocks_data.append(
+                        (addr, local_block_len, nixl_agent_meta.device_id)
+                    )
 
                 if kv_topo.is_kv_layout_blocks_first:
                     # With FlashInfer index V separately to allow head splitting.
@@ -2831,13 +2762,13 @@ class NixlConnectorWorker:
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
 
-        # Option D: P-side chunk-interleave + transpose to shadow buffer.
+        # Option D: P-side chunk-interleave + transpose in-place.
         # Permute conv blocks for requests about to be sent so D can
         # RDMA-read its shard as a contiguous byte range via rank_offset.
-        if self._mamba_conv_shadow_bufs and metadata.reqs_to_permute_blocks:
+        if self._mamba_chunk_perm_fwd is not None and metadata.reqs_to_permute_blocks:
             for req_id, block_ids in metadata.reqs_to_permute_blocks.items():
                 physical_block_ids = self._logical_to_kernel_block_ids(block_ids)
-                self._chunk_transpose_to_shadow(physical_block_ids)
+                self._chunk_transpose_inplace(physical_block_ids)
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.kv_topo is not None
