@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.block_transfer_policy import (
+    EngineTransferParams,
     ModelBlockTransferPolicy,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -222,6 +223,7 @@ class NixlConnectorWorker:
         # with TpKVTopology into a unified per-engine topology object.
         self._mamba_phys_ratio: dict[EngineId, int] = {}
         self._transfer_configs: dict[EngineId, Any] = {}
+        self._engine_transfer_params: dict[EngineId, EngineTransferParams] = {}
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -799,6 +801,9 @@ class NixlConnectorWorker:
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self.block_transfer_policy.ssm_sizes,
+            group_block_sizes=[
+                g.kv_cache_spec.block_size for g in self.kv_cache_config.kv_cache_groups
+            ],
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1016,7 +1021,7 @@ class NixlConnectorWorker:
         # rank. With heterogeneous TP, prepare the descriptors by splitting the
         # P KV cache along kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
-        blocks_data = self.block_transfer_policy.build_remote_descs(
+        blocks_data, transfer_params = self.block_transfer_policy.build_remote_descs(
             nixl_agent_meta=nixl_agent_meta,
             block_size_ratio=block_size_ratio,
             tp_ratio=tp_ratio,
@@ -1031,12 +1036,16 @@ class NixlConnectorWorker:
                 1,
             ),
         )
+        if transfer_params is not None:
+            self._engine_transfer_params[engine_id] = transfer_params
         logger.debug(
-            "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
+            "Created %s blocks for dst engine %s with remote rank %s "
+            "and local rank %s (transfer_params=%s)",
             len(blocks_data),
             engine_id,
             remote_tp_rank,
             self.tp_rank,
+            transfer_params,
         )
 
         # Register with NIXL.
@@ -1541,6 +1550,9 @@ class NixlConnectorWorker:
             transfer_config=self._transfer_configs.get(
                 meta.remote.engine_id,
             ),
+            transfer_params=self._engine_transfer_params.get(
+                meta.remote.engine_id,
+            ),
         )
         # MLA opt: when P_TP > D_TP, only one read needed (cache duplicated).
         # TODO (ZhanqiuHu): Refactor: MLA model-specific logics
@@ -1698,9 +1710,11 @@ class NixlConnectorWorker:
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
+        remote_tp = self._engine_transfer_params.get(dst_engine_id)
         remote_block_descs_ids = self._get_block_descs_ids(
             dst_engine_id,
             remote_block_ids,
+            transfer_params=remote_tp,
         )
         local_block_descs_ids = self._get_block_descs_ids(
             self.engine_id,
@@ -1708,7 +1722,19 @@ class NixlConnectorWorker:
             block_size_ratio=block_size_ratio,
         )
 
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        assert len(local_block_descs_ids) == len(remote_block_descs_ids), (
+            f"Desc ID length mismatch: local={len(local_block_descs_ids)} "
+            f"remote={len(remote_block_descs_ids)} "
+            f"local_groups={[len(g) for g in local_block_ids]} "
+            f"remote_groups={[len(g) for g in remote_block_ids]} "
+            f"transfer_params={remote_tp}"
+        )
+
+        if len(local_block_descs_ids) > 0:
+            assert local_block_descs_ids.max() < self.num_descs, (
+                f"Local desc ID {local_block_descs_ids.max()} >= "
+                f"num_descs {self.num_descs}"
+            )
 
         # Prepare transfer with Nixl.
         handle = None
@@ -1772,6 +1798,7 @@ class NixlConnectorWorker:
         engine_id: str,
         block_ids: BlockIds,
         block_size_ratio: float | None = None,
+        transfer_params: EngineTransferParams | None = None,
     ) -> np.ndarray:
         """
         Get the descs ids for a set of block ids.
@@ -1788,6 +1815,7 @@ class NixlConnectorWorker:
                 engine_id,
                 1,
             ),
+            transfer_params=transfer_params,
         )
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:

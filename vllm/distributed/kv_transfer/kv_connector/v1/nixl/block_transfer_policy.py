@@ -46,6 +46,36 @@ class ReadSpec:
     remote_block_ids: BlockIds
 
 
+@dataclass(frozen=True)
+class EngineTransferParams:
+    """Per-remote-engine transfer parameters, computed by policy during
+    ``build_remote_descs`` and stored by ``worker.py`` per engine_id.
+
+    The policy itself is stateless — all per-engine mutable state lives
+    in worker.py via this dataclass.
+    """
+
+    page_ratio: int
+    """remote_page_size / local_page_size (uniform across groups with HMA).
+    When 1, no sub-descriptor expansion is needed (standard transfer)."""
+
+    group_token_expansions: tuple[int, ...]
+    """Per-group: remote_block_size_g / local_block_size_g.
+    >1 when P packs more tokens per block for this group (e.g. FA in 2p4d)."""
+
+    group_head_ratios: tuple[int, ...]
+    """Per-group: page_ratio / token_expansion_g.
+    >1 when D reads a subset of P's heads (e.g. SWA in 2p4d)."""
+
+    remote_num_descs_per_region: int
+    """remote num_blocks * page_ratio — the desc stride per NIXL region
+    in the remote handle (used by get_block_descs_ids)."""
+
+    rank_sub_index: int
+    """tp_rank % page_ratio — selects which sub-desc this worker reads
+    for non-expanded (head-split) groups."""
+
+
 class ModelBlockTransferPolicy(ABC):
     """ABC for model-specific block transfer policies.
 
@@ -165,6 +195,7 @@ class ModelBlockTransferPolicy(ABC):
         block_len_per_layer: list[int],
         block_size_ratio: float | None = None,
         physical_blocks_per_logical: int = 1,
+        transfer_params: EngineTransferParams | None = None,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for a set of block IDs."""
         ...
@@ -266,8 +297,13 @@ class ModelBlockTransferPolicy(ABC):
         indexes_into_remote: bool,
         transfer_config: Any | None = None,
         physical_blocks_per_logical: int = 1,
-    ) -> list[tuple[int, int, int]]:
-        """Build remote (dst) descriptor tuples."""
+    ) -> tuple[list[tuple[int, int, int]], EngineTransferParams | None]:
+        """Build remote (dst) descriptor tuples.
+
+        Returns (descs, transfer_params). transfer_params is stored by
+        worker.py per engine_id and passed back into get_block_descs_ids
+        and compute_read_specs.
+        """
         ...
 
     @abstractmethod
@@ -288,6 +324,7 @@ class ModelBlockTransferPolicy(ABC):
         remote_ranks: list[int],
         physical_blocks_per_logical: int = 1,
         transfer_config: Any | None = None,
+        transfer_params: EngineTransferParams | None = None,
     ) -> list[ReadSpec]:
         """Compute the full set of read operations needed for a request.
 
@@ -309,7 +346,22 @@ class ModelBlockTransferPolicy(ABC):
 
 
 class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
-    """Block transfer policy for dense (FA-only) models."""
+    """Block transfer policy for dense (FA-only) models.
+
+    Stateless after __init__: holds only immutable config derived from
+    kv_cache_config. All per-engine state is returned via
+    EngineTransferParams and managed by worker.py.
+    """
+
+    def __init__(
+        self,
+        kv_cache_config: KVCacheConfig,
+        physical_blocks_per_logical: int,
+    ):
+        super().__init__(kv_cache_config, physical_blocks_per_logical)
+        groups = kv_cache_config.kv_cache_groups
+        self._num_groups = len(groups)
+        self._group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
 
     @property
     def is_mamba(self) -> bool:
@@ -351,13 +403,27 @@ class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
         block_len_per_layer,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
+        transfer_params=None,
     ):
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
+
+        if transfer_params is not None and transfer_params.page_ratio > 1:
+            num_blocks = transfer_params.remote_num_descs_per_region
+
         region_ids = np.arange(num_regions)[:, None]
         block_ids_arr = np.concatenate(block_ids)[None, :]
-        return (region_ids * num_blocks + block_ids_arr).flatten()
+        result = (region_ids * num_blocks + block_ids_arr).flatten()
+
+        max_valid = num_regions * num_blocks
+        if len(result) > 0:
+            assert result.min() >= 0, f"Negative desc ID: {result.min()}"
+            assert result.max() < max_valid, (
+                f"Desc ID {result.max()} >= max valid {max_valid} "
+                f"(num_regions={num_regions}, num_blocks={num_blocks})"
+            )
+        return result
 
     def logical_to_kernel_block_ids(self, block_ids):
         if self._physical_blocks_per_logical == 1:
@@ -411,6 +477,61 @@ class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
             is_blocks_first,
         )
 
+    # ---- Transfer param computation (pure function) ----
+
+    def _compute_transfer_params(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        block_len_per_layer: list[int],
+        tp_rank: int,
+        tp_ratio: int,
+    ) -> EngineTransferParams:
+        """Compute per-engine transfer params from remote metadata.
+
+        Pure computation: no side effects, no stored state.
+        """
+        n = max(self._num_groups, 1)
+        remote_gbs = getattr(nixl_agent_meta, "group_block_sizes", None)
+
+        if not block_len_per_layer or block_len_per_layer[0] == 0:
+            return EngineTransferParams(
+                page_ratio=1,
+                group_token_expansions=(1,) * n,
+                group_head_ratios=(1,) * n,
+                remote_num_descs_per_region=nixl_agent_meta.num_blocks,
+                rank_sub_index=0,
+            )
+
+        page_ratio = max(nixl_agent_meta.block_lens[0] // block_len_per_layer[0], 1)
+
+        if remote_gbs is None or self._num_groups <= 1 or page_ratio <= 1:
+            rank_sub = tp_rank % page_ratio if page_ratio > 1 and tp_ratio > 0 else 0
+            return EngineTransferParams(
+                page_ratio=page_ratio,
+                group_token_expansions=(1,) * n,
+                group_head_ratios=(page_ratio,) * n,
+                remote_num_descs_per_region=(nixl_agent_meta.num_blocks * page_ratio),
+                rank_sub_index=rank_sub,
+            )
+
+        expansions: list[int] = []
+        head_ratios: list[int] = []
+        for g in range(self._num_groups):
+            token_exp = max(remote_gbs[g] // self._group_block_sizes[g], 1)
+            head_ratio = max(page_ratio // token_exp, 1)
+            expansions.append(token_exp)
+            head_ratios.append(head_ratio)
+
+        return EngineTransferParams(
+            page_ratio=page_ratio,
+            group_token_expansions=tuple(expansions),
+            group_head_ratios=tuple(head_ratios),
+            remote_num_descs_per_region=(nixl_agent_meta.num_blocks * page_ratio),
+            rank_sub_index=(tp_rank % page_ratio if tp_ratio > 0 else 0),
+        )
+
+    # ---- Remote descriptor building ----
+
     def build_remote_descs(
         self,
         nixl_agent_meta,
@@ -424,6 +545,46 @@ class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
         transfer_config=None,
         physical_blocks_per_logical=1,
     ):
+        tp = self._compute_transfer_params(
+            nixl_agent_meta,
+            block_len_per_layer,
+            tp_rank,
+            tp_ratio,
+        )
+
+        if tp.page_ratio > 1:
+            result = self._build_subdesc_remote(
+                nixl_agent_meta,
+                block_len_per_layer,
+                is_blocks_first,
+                tp,
+            )
+        else:
+            result = self._build_standard_remote(
+                nixl_agent_meta,
+                block_size_ratio,
+                tp_ratio,
+                tp_rank,
+                use_mla,
+                block_len_per_layer,
+                is_blocks_first,
+                indexes_into_remote,
+            )
+
+        return result, tp
+
+    def _build_standard_remote(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        block_size_ratio: int,
+        tp_ratio: int,
+        tp_rank: int,
+        use_mla: bool,
+        block_len_per_layer: list[int],
+        is_blocks_first: bool,
+        indexes_into_remote: bool,
+    ) -> list[tuple[int, int, int]]:
+        """Standard remote desc registration (page_ratio <= 1)."""
         result: list[tuple[int, int, int]] = []
         for i, base_addr in enumerate(
             nixl_agent_meta.kv_caches_base_addr,
@@ -442,12 +603,15 @@ class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
             rank_offset = (
                 tp_rank % tp_ratio * remote_kv_block_len if indexes_into_remote else 0
             )
+
             num_blocks = nixl_agent_meta.num_blocks
             page_size = nixl_agent_meta.block_lens[i]
             dev_id = nixl_agent_meta.device_id
+
             for blk in range(num_blocks):
                 addr = base_addr + blk * page_size + rank_offset
                 result.append((addr, local_block_len, dev_id))
+
             if is_blocks_first:
                 second_split = self.get_block_len(
                     i,
@@ -462,6 +626,102 @@ class DenseModelBlockTransferPolicy(ModelBlockTransferPolicy):
                     v_addr = addr + nixl_agent_meta.block_lens[i] // 2
                     result.append((v_addr, second_split, dev_id))
         return result
+
+    def _build_subdesc_remote(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        block_len_per_layer: list[int],
+        is_blocks_first: bool,
+        tp: EngineTransferParams,
+    ) -> list[tuple[int, int, int]]:
+        """Sub-descriptor registration for page_ratio > 1.
+
+        Group-agnostic: registers page_ratio sub-descs per block per region,
+        each of local block_len size. Any block could be SWA or FA — the
+        group-aware sub-desc selection happens in compute_read_specs.
+        """
+        result: list[tuple[int, int, int]] = []
+        page_ratio = tp.page_ratio
+        for i, base_addr in enumerate(
+            nixl_agent_meta.kv_caches_base_addr,
+        ):
+            local_block_len = self.get_block_len(
+                i,
+                True,
+                block_len_per_layer,
+                is_blocks_first,
+            )
+            num_blocks = nixl_agent_meta.num_blocks
+            page_size = nixl_agent_meta.block_lens[i]
+            dev_id = nixl_agent_meta.device_id
+
+            for blk in range(num_blocks):
+                for s in range(page_ratio):
+                    addr = base_addr + blk * page_size + s * local_block_len
+                    result.append((addr, local_block_len, dev_id))
+
+            if is_blocks_first:
+                v_block_len = self.get_block_len(
+                    i,
+                    False,
+                    block_len_per_layer,
+                    is_blocks_first,
+                )
+                half_page = page_size // 2
+                for blk in range(num_blocks):
+                    for s in range(page_ratio):
+                        v_addr = (
+                            base_addr + blk * page_size + half_page + s * v_block_len
+                        )
+                        result.append((v_addr, v_block_len, dev_id))
+        return result
+
+    # ---- Read spec computation (group-aware) ----
+
+    def compute_read_specs(
+        self,
+        local_block_ids,
+        remote_block_ids,
+        remote_ranks,
+        physical_blocks_per_logical=1,
+        transfer_config=None,
+        transfer_params=None,
+    ):
+        if transfer_params is None or transfer_params.page_ratio <= 1:
+            return super().compute_read_specs(
+                local_block_ids,
+                remote_block_ids,
+                remote_ranks,
+                physical_blocks_per_logical,
+                transfer_config,
+                transfer_params,
+            )
+
+        pr = transfer_params.page_ratio
+        rank_sub = transfer_params.rank_sub_index
+
+        processed_remote: list[list[int]] = []
+        for g in range(self._num_groups):
+            remote_g = remote_block_ids[g]
+            token_exp = transfer_params.group_token_expansions[g]
+
+            if token_exp > 1:
+                expanded: list[int] = []
+                for b in remote_g:
+                    for s in range(pr):
+                        expanded.append(b * pr + s)
+                processed_remote.append(expanded)
+            else:
+                processed_remote.append([b * pr + rank_sub for b in remote_g])
+
+        return [
+            ReadSpec(
+                remote_rank=rank,
+                local_block_ids=local_block_ids,
+                remote_block_ids=processed_remote,
+            )
+            for rank in remote_ranks
+        ]
 
     def build_src_split_handles(
         self,
@@ -584,6 +844,7 @@ class MambaModelBlockTransferPolicy(ModelBlockTransferPolicy):
         block_len_per_layer,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
+        transfer_params=None,
     ):
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -759,7 +1020,7 @@ class MambaModelBlockTransferPolicy(ModelBlockTransferPolicy):
                 physical_blocks_per_logical,
             )
         )
-        return result
+        return result, None
 
     def _build_fa_remote_descs(
         self,
@@ -916,6 +1177,7 @@ class MambaModelBlockTransferPolicy(ModelBlockTransferPolicy):
         remote_ranks,
         physical_blocks_per_logical=1,
         transfer_config=None,
+        transfer_params=None,
     ):
         expanded = self.logical_to_remote_kernel_block_ids(
             remote_block_ids,

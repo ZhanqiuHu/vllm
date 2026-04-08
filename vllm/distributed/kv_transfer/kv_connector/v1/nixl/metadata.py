@@ -32,6 +32,7 @@ class NixlAgentMetadata:
     kv_cache_layout: str
     block_size: int
     ssm_sizes: tuple[int, int]
+    group_block_sizes: list[int] | None = None
 
 
 @dataclass
