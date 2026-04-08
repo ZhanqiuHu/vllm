@@ -523,7 +523,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
-        self.draft_id_to_target_id = None
+        self.draft_id_to_target_id = nn.Parameter(
+            torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+            requires_grad=False,
+        )
 
     def embed_input_ids(
         self,
@@ -546,7 +549,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
-        if self.draft_id_to_target_id is None:
+        if self.config.draft_vocab_size == self.config.vocab_size:
             return logits
 
         base = torch.arange(self.config.draft_vocab_size, device=logits.device)
@@ -591,7 +594,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             assert "mask_hidden" not in name, (
                 "DFlash should use mask_token_id to embed the padding hidden state"
             )
-            if "t2d" in name:
+            if "t2d" in name or "verifier" in name:
                 continue
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
@@ -603,7 +606,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
-        skip_substrs = []
+        skip_substrs: list[str] = []
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:
