@@ -7,7 +7,7 @@ from vllm import LLM
 from vllm.config import SpeculativeConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 
-MODEL_PATH = "shanjiaz/speculators-dflash-format"
+MODEL_PATH = "nm-testing/dflash-qwen3-8b-speculators"
 
 EXPECTED_GSM8K_ACCURACY = 0.885
 ACCURACY_RTOL = 0.03
