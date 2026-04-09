@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
-
 import torch
 
 from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
 from vllm import LLM
 from vllm.config import SpeculativeConfig
 from vllm.distributed import cleanup_dist_env_and_memory
-
-logger = logging.getLogger(__name__)
 
 MODEL_PATH = "nm-testing/dflash-qwen3-8b-speculators"
 
@@ -95,7 +91,6 @@ def test_dflash_speculators_correctness():
     assert accuracy >= accuracy_threshold, (
         f"Expected GSM8K accuracy >= {accuracy_threshold:.3f}, got {accuracy:.3f}"
     )
-    logger.info("GSM8K accuracy: %.3f (threshold: %.3f)", accuracy, accuracy_threshold)
 
     current_metrics = spec_llm.get_metrics()
     acceptance_len = compute_acceptance_len(current_metrics)
@@ -104,9 +99,6 @@ def test_dflash_speculators_correctness():
     assert acceptance_len >= al_threshold, (
         f"DFlash speculators acceptance length too low: "
         f"{acceptance_len:.2f} < {al_threshold:.2f}"
-    )
-    logger.info(
-        "Acceptance length: %.2f (threshold: %.2f)", acceptance_len, al_threshold
     )
 
     del spec_llm
