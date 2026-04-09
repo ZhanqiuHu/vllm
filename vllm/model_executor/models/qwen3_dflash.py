@@ -594,7 +594,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             assert "mask_hidden" not in name, (
                 "DFlash should use mask_token_id to embed the padding hidden state"
             )
-            if "t2d" in name or "verifier" in name:
+            if "t2d" in name:
                 continue
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
