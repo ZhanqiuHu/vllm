@@ -24,7 +24,7 @@ def compute_acceptance_len(metrics) -> float:
     return 1 + (n_accepted / n_drafts)
 
 
-def test_dflash_speculators_model(vllm_runner, example_prompts, monkeypatch):
+def test_dflash_speculators_model(vllm_runner, example_prompts):
     """
     Test DFlash speculators model properly initializes speculative decoding.
 
@@ -35,8 +35,6 @@ def test_dflash_speculators_model(vllm_runner, example_prompts, monkeypatch):
     4. Speculative tokens count is valid (num_speculative_tokens=8)
     5. Text generation works with speculative decoding enabled
     """
-    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
     with vllm_runner(
         MODEL_PATH, dtype=torch.bfloat16, enforce_eager=True
     ) as vllm_model:
