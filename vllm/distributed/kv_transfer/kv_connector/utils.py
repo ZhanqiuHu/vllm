@@ -938,3 +938,585 @@ def get_current_attn_backend(
 #     def transfer_targets(self, engine_id) -> list[int]: ...
 #     def should_skip_fa(self, engine_id, p_rank) -> bool: ...
 #     def filter_block_ids_for_rank(self, engine_id, ...) -> ...: ...
+
+
+# ---- Per-engine transfer info ----
+
+
+@dataclass(frozen=True)
+class EngineTransferInfo:
+    """Common per-remote-engine transfer state, computed at handshake.
+
+    Stored per ``engine_id`` inside ``TransferTopology._engines``.
+    """
+
+    remote_tp_size: int
+
+    remote_block_len: int
+    """Block length (bytes)"""
+
+    remote_block_size: int
+    """Tokens per block."""
+
+    remote_physical_blocks_per_logical: int
+    """Physical blocks per logical block."""
+
+
+@dataclass(frozen=True)
+class MambaEngineTransferInfo(EngineTransferInfo):
+    """Extends ``EngineTransferInfo`` with Mamba-hybrid transfer geometry.
+
+    For hybrid SSM+Attention models, FA and Mamba layers may require
+    different numbers of reads from different remote ranks.  This
+    dataclass captures that per-engine transfer plan.
+    """
+
+    remote_fa_source_ranks: tuple[int, ...]
+    """Remote ranks carrying unique FA heads for this local rank."""
+
+    remote_all_source_ranks: tuple[int, ...]
+    """All remote ranks this local rank reads from (FA + Mamba)."""
+
+    remote_num_fa_reads: int
+    """Number of distinct remote ranks needed for FA data."""
+
+    remote_num_mamba_reads: int
+    """Number of distinct remote ranks needed for Mamba data."""
+
+    remote_fa_descriptor_bytes: int
+    """Byte size of one FA K (or V) descriptor entry."""
+
+    is_remote_replicated: bool
+    """Whether the remote engine has replicated KV heads
+    (remote_tp_size > total_num_kv_heads)."""
+
+    remote_physical_heads: int
+    """Physical KV heads stored per remote rank."""
+
+
+# ---- Transfer topology ----
+
+
+class TransferTopology:
+    """Single source of truth for local TP identity and per-engine remote info.
+
+    Replaces the combination of ``TpKVTopology`` (local identity + layout
+    detection + per-engine dicts) and ``HeteroTPTransferConfig`` (Mamba
+    transfer geometry) with a single object per worker.
+    """
+
+    def __init__(
+        self,
+        tp_rank: int,
+        tp_size: int,
+        block_size: int,
+        engine_id: EngineId,
+        is_mla: bool,
+        is_mamba: bool,
+        total_num_kv_heads: int,
+        attn_backends: list[type[AttentionBackend]],
+        tensor_shape: torch.Size | None = None,
+    ):
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.block_size = block_size
+        self.engine_id = engine_id
+        self.is_mla = is_mla
+        self.is_mamba = is_mamba
+        self.total_num_kv_heads = total_num_kv_heads
+        self.attn_backends = attn_backends
+        self.tensor_shape = tensor_shape
+
+        self.local_physical_heads = max(1, total_num_kv_heads // tp_size)
+
+        self._engines: dict[EngineId, EngineTransferInfo] = {}
+        # FA source lookup caches (Mamba only, built in register_remote_engine)
+        self._fa_source_sets: dict[EngineId, frozenset[int]] = {}
+        self._fa_source_indices: dict[EngineId, dict[int, int]] = {}
+
+        # ---- Layout detection (from TpKVTopology.__post_init__) ----
+        # Figure out whether the first dimension of the cache is K/V
+        # or num_blocks.
+        attn_backend = attn_backends[0]
+        if not is_mamba:
+            _MOCK_BLOCK_SIZE = 16
+            kv_cache_shape: tuple[int, ...] = attn_backend.get_kv_cache_shape(
+                num_blocks=1,
+                block_size=_MOCK_BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=1,
+            )
+            logger.debug("Test kv_cache_shape: %s", kv_cache_shape)
+        # Non-MLA backends caches have 5 dims [2, num_blocks, H,N,D],
+        # we just mock num_blocks to 1 for the dimension check below.
+        # Hybrid SSM models assume a single blocks_first layout
+        self._is_kv_layout_blocks_first = is_mamba or (
+            len(kv_cache_shape) == 5 and kv_cache_shape[0] == 1
+        )
+
+        self._cross_layers_blocks = False
+        if tensor_shape is not None:
+            self._cross_layers_blocks = len(tensor_shape) == len(kv_cache_shape) + 1
+
+        if self._cross_layers_blocks:
+            logger.debug("Using cross-layer KV cache")
+            # prepend layers dimension
+            _MOCK_NUM_LAYERS = 80
+            kv_cache_shape = (_MOCK_NUM_LAYERS,) + kv_cache_shape
+            try:
+                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
+                    include_num_layers_dimension=self._cross_layers_blocks
+                )
+            except (AttributeError, NotImplementedError):
+                assert tensor_shape is not None
+                kv_cache_stride_order = tuple(range(len(tensor_shape)))
+            # In case of cross layers permute kv_cache_shape according to
+            # stride_order to retrieve physical position of block_size
+            kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+
+    # ============================================================
+    # Engine registration (new)
+    # ============================================================
+
+    def register_remote_engine(
+        self,
+        remote_engine_id: EngineId,
+        remote_tp_size: int,
+        remote_block_size: int,
+        remote_block_len: int,
+        remote_physical_blocks_per_logical: int,
+        *,
+        local_block_len: int = 0,
+    ) -> EngineTransferInfo:
+        """Register a remote engine, replacing scattered worker dicts.
+
+        Only remote engines should be registered here — the local engine's
+        identity (tp_size, block_size, etc.) is set via ``__init__`` params.
+
+        For Mamba models, also computes the Mamba transfer plan and
+        builds the FA source lookup caches.
+
+        Args:
+            local_block_len: Local representative block_len (bytes).
+                Required for Mamba models to compute ``fa_descriptor_bytes``.
+        """
+        assert remote_engine_id != self.engine_id, (
+            f"Cannot register local engine {self.engine_id} as remote. "
+            f"Local identity is set via __init__ params."
+        )
+        info: EngineTransferInfo
+        if self.is_mamba:
+            info = self._build_mamba_info(
+                remote_tp_size=remote_tp_size,
+                remote_block_size=remote_block_size,
+                remote_block_len=remote_block_len,
+                remote_physical_blocks_per_logical=(remote_physical_blocks_per_logical),
+                local_block_len=local_block_len,
+            )
+            self._fa_source_sets[remote_engine_id] = frozenset(
+                info.remote_fa_source_ranks
+            )
+            self._fa_source_indices[remote_engine_id] = {
+                r: i for i, r in enumerate(info.remote_fa_source_ranks)
+            }
+        else:
+            info = EngineTransferInfo(
+                remote_tp_size=remote_tp_size,
+                remote_block_len=remote_block_len,
+                remote_block_size=remote_block_size,
+                remote_physical_blocks_per_logical=(remote_physical_blocks_per_logical),
+            )
+        self._engines[remote_engine_id] = info
+        return info
+
+    def get_engine_info(self, remote_engine_id: EngineId) -> EngineTransferInfo:
+        return self._engines[remote_engine_id]
+
+    # ============================================================
+    # Layout properties (from TpKVTopology)
+    # ============================================================
+
+    @property
+    def is_kv_layout_blocks_first(self) -> bool:
+        return self._is_kv_layout_blocks_first
+
+    @property
+    def cross_layers_blocks(self) -> bool:
+        return self._cross_layers_blocks
+
+    @property
+    def split_k_and_v(self) -> bool:
+        # Whether to register regions for K and V separately (when present).
+        return not (
+            self._cross_layers_blocks or self.is_mla or self.is_kv_layout_blocks_first
+        )
+
+    # ============================================================
+    # Common methods (from TpKVTopology)
+    # ============================================================
+
+    def tp_ratio(self, remote_engine_id: EngineId) -> int:
+        """Calculate the tensor parallel ratio between local and remote TP.
+
+        Positive when local_tp >= remote_tp (local workers read from the
+        same remote worker in groups of size ``tp_ratio``).  Negative when
+        remote_tp > local_tp (ratio is flipped).
+        """
+        remote_tp_size = self._engines[remote_engine_id].remote_tp_size
+        if self.tp_size >= remote_tp_size:
+            assert self.tp_size % remote_tp_size == 0, (
+                f"Local tensor parallel size {self.tp_size} is not divisible "
+                f"by remote tensor parallel size {remote_tp_size}."
+            )
+            return self.tp_size // remote_tp_size
+        assert remote_tp_size % self.tp_size == 0, (
+            f"Remote tensor parallel size {remote_tp_size} is not divisible "
+            f"by local tensor parallel size {self.tp_size}."
+        )
+        return -(remote_tp_size // self.tp_size)
+
+    def block_size_ratio(self, remote_engine_id: EngineId) -> int:
+        """Calculate the block size ratio between local and remote."""
+        remote_block_size = self._engines[remote_engine_id].remote_block_size
+        assert self.block_size % remote_block_size == 0, (
+            f"Local block size {self.block_size} is not divisible "
+            f"by remote block size {remote_block_size} or vice versa."
+        )
+        return self.block_size // remote_block_size
+
+    def is_kv_replicated(self, remote_engine_id: EngineId) -> bool:
+        """Whether the KV cache is replicated across TP workers due to the
+        number of TP workers being greater than the number of KV heads.
+        """
+        return self._engines[remote_engine_id].remote_tp_size > self.total_num_kv_heads
+
+    def replicates_kv_cache(self, remote_engine_id: EngineId) -> bool:
+        # MLA is always replicated as the hidden dim can't be split.
+        return self.is_mla or self.is_kv_replicated(remote_engine_id)
+
+    def target_remote_ranks(self, remote_engine_id: EngineId) -> list[int]:
+        """Get the remote TP rank(s) that the current local TP rank will
+        read from.  When remote tp_size > local tp_size, reads from
+        multiple remote ranks.
+
+        For Mamba models, returns the precomputed ``all_source_ranks``
+        (FA + Mamba union).  (NEW: original TpKVTopology does not have
+        this Mamba branch; worker.py called transfer_config directly.)
+        """
+        info = self._engines[remote_engine_id]
+        if isinstance(info, MambaEngineTransferInfo):
+            return list(info.remote_all_source_ranks)
+
+        ratio = self.tp_ratio(remote_engine_id)
+        if ratio > 0:
+            return [self.tp_rank // ratio]
+        # remote TP > local TP: read from |ratio| remote workers
+        abs_ratio = -ratio
+        return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
+
+    def get_transfer_cache_regions(
+        self, cache: torch.Tensor, layer_spec: "KVCacheSpec"
+    ) -> list[torch.Tensor] | torch.Tensor:
+        """Return the cache tensor(s) to register as NIXL memory regions,
+        also accounting for hybrid SSM models specificities.
+        """
+        if isinstance(layer_spec, MambaSpec):
+            # Register the whole kv cache shared tensor, including
+            # SSM/Conv.
+            conv, ssm = cache
+            return [conv]
+
+        # Check may be hacky but it's matching
+        # `_update_hybrid_attention_mamba_layout`.
+        if self.is_mamba and cache.shape[0] == 2:
+            # When MAMBA is present, all backends are blocks first, so
+            # that blocks can be shared between attention layers and mamba
+            # layers.  Runner already adjusted strides for FlashAttn-like
+            # backends so its num_blocks first.
+            # Swap [2<>num_blocks] dims for hybrid SSM layout.
+            cache = cache.transpose(0, 1)
+
+        # Regular case: backends like FA register K/V in separate regions
+        return cache if self.split_k_and_v else [cache]
+
+    # ============================================================
+    # Mamba-specific (from HeteroTPTransferConfig)
+    #
+    # These methods will move to MambaModelBlockTransferPolicy in a
+    # future refactor (Phase 2).
+    # ============================================================
+
+    def _get_mamba_info(self, remote_engine_id: EngineId) -> MambaEngineTransferInfo:
+        """Retrieve Mamba per-engine info, asserting correct type."""
+        assert self.is_mamba, (
+            "Mamba transfer methods called on non-Mamba TransferTopology"
+        )
+        info = self._engines[remote_engine_id]
+        assert isinstance(info, MambaEngineTransferInfo), (
+            f"Expected MambaEngineTransferInfo for {remote_engine_id}, "
+            f"got {type(info).__name__}"
+        )
+        return info
+
+    def should_skip_fa(self, remote_engine_id: EngineId, remote_rank: int) -> bool:
+        """Whether to skip FA groups for this remote rank (mamba-only)."""
+        return remote_rank not in self._fa_source_sets[remote_engine_id]
+
+    def fa_head_slot(self, remote_engine_id: EngineId, remote_rank: int) -> int:
+        """Index into local FA block for this remote rank's head data.
+
+        For remote ranks in ``fa_source_ranks``, returns 0, 1, …, reads-1.
+        For ranks NOT in ``fa_source_ranks`` (replicated duplicates),
+        returns the slot of the matching source rank with the same head.
+        """
+        fa_index = self._fa_source_indices[remote_engine_id]
+        if remote_rank in fa_index:
+            return fa_index[remote_rank]
+        mamba_info = self._get_mamba_info(remote_engine_id)
+        K = self.total_num_kv_heads
+        remote_tp = mamba_info.remote_tp_size
+        r_head = _physical_head_range(remote_tp, K, remote_rank)
+        for target in mamba_info.remote_fa_source_ranks:
+            t_head = _physical_head_range(remote_tp, K, target)
+            if _range_overlap(r_head, t_head):
+                return fa_index[target]
+        return 0
+
+    def fa_rank_offset(
+        self, remote_engine_id: EngineId, remote_kv_block_len: int
+    ) -> int:
+        """Byte offset into remote FA block for this local rank.
+
+        When local TP is replicated (local_tp > K), multiple local ranks
+        share a head.  Computes offset *relative to the target remote
+        rank's first head* so it works regardless of how many heads the
+        remote has.  Returns 0 when local does not index into remote.
+        """
+        ratio = self.tp_ratio(remote_engine_id)
+        if self.is_mla or ratio <= 0:
+            return 0
+        mamba_info = self._get_mamba_info(remote_engine_id)
+        K = self.total_num_kv_heads
+        is_local_replicated = self.tp_size > K
+        if is_local_replicated:
+            local_head = self.tp_rank * K // self.tp_size
+            p_rank = mamba_info.remote_fa_source_ranks[0]
+            p_start = p_rank * K // mamba_info.remote_tp_size
+            return (local_head - p_start) * remote_kv_block_len
+        return self.tp_rank % ratio * remote_kv_block_len
+
+    def needs_split_handles(self, remote_engine_id: EngineId) -> bool:
+        """Whether per-remote-rank split handles are needed.
+
+        True when FA and mamba have different read counts, requiring
+        different splitting factors in the local handle.
+        """
+        mamba_info = self._get_mamba_info(remote_engine_id)
+        ratio = self.tp_ratio(remote_engine_id)
+        return (
+            ratio < 0
+            and not self.is_mla
+            and len(mamba_info.remote_all_source_ranks) > 1
+        )
+
+    def compute_split_handle_data(
+        self,
+        remote_engine_id: EngineId,
+        src_blocks_data: list[tuple[int, int, int]],
+        num_fa_descs: int,
+        abs_tp: int,
+    ) -> list[list[tuple[int, int, int]]]:
+        """Per-remote-rank (addr, len, dev) triples for Mamba-HMA split
+        handles.
+
+        FA descriptors (indices < num_fa_descs) are sliced by
+        ``remote_num_fa_reads``; mamba descriptors are sliced uniformly
+        by ``abs_tp``.
+        """
+        mamba_info = self._get_mamba_info(remote_engine_id)
+        all_handle_data: list[list[tuple[int, int, int]]] = []
+        for p_idx, p_rank in enumerate(mamba_info.remote_all_source_ranks):
+            handle_data: list[tuple[int, int, int]] = []
+            skip_fa = self.should_skip_fa(remote_engine_id, p_rank)
+            fa_slot = self.fa_head_slot(remote_engine_id, p_rank) if not skip_fa else 0
+            for j, (addr, local_len, dev) in enumerate(src_blocks_data):
+                if j < num_fa_descs:
+                    assert mamba_info.remote_num_fa_reads >= 1
+                    fa_chunk = local_len // mamba_info.remote_num_fa_reads
+                    handle_data.append((addr + fa_slot * fa_chunk, fa_chunk, dev))
+                else:
+                    mamba_chunk = local_len // abs_tp
+                    handle_data.append((addr + p_idx * mamba_chunk, mamba_chunk, dev))
+            all_handle_data.append(handle_data)
+        return all_handle_data
+
+    def filter_block_ids_for_rank(
+        self,
+        remote_engine_id: EngineId,
+        remote_rank: int,
+        local_ids: BlockIds,
+        remote_ids: BlockIds,
+        is_mamba_group: list[bool],
+    ) -> tuple[BlockIds, BlockIds]:
+        """Zero out FA groups for remote ranks outside ``fa_source_ranks``.
+
+        Returns (filtered_local_ids, filtered_remote_ids).  When the
+        remote rank carries FA data for this local rank, returns the
+        inputs unchanged.
+        """
+        if not self.should_skip_fa(remote_engine_id, remote_rank):
+            return local_ids, remote_ids
+        num_groups = len(local_ids)
+        filtered_local: list[list[int]] = [
+            [] if not is_mamba_group[g] else local_ids[g] for g in range(num_groups)
+        ]
+        filtered_remote: list[list[int]] = [
+            [] if not is_mamba_group[g] else remote_ids[g] for g in range(num_groups)
+        ]
+        return filtered_local, filtered_remote
+
+    def describe_mamba(self, remote_engine_id: EngineId) -> str:
+        """One-line summary of Mamba transfer config for logging."""
+        mamba_info = self._get_mamba_info(remote_engine_id)
+        return (
+            f"TransferTopology.mamba("
+            f"tp_ratio={self.tp_ratio(remote_engine_id)}, "
+            f"K={self.total_num_kv_heads}, "
+            f"local_tp={self.tp_size}, "
+            f"remote_tp={mamba_info.remote_tp_size}, "
+            f"local_rank={self.tp_rank}, "
+            f"fa_reads={mamba_info.remote_num_fa_reads}, "
+            f"mamba_reads={mamba_info.remote_num_mamba_reads}, "
+            f"fa_sources={list(mamba_info.remote_fa_source_ranks)}, "
+            f"all_sources={list(mamba_info.remote_all_source_ranks)}, "
+            f"fa_desc_bytes={mamba_info.remote_fa_descriptor_bytes}, "
+            f"remote_block_len={mamba_info.remote_block_len})"
+        )
+
+    # ============================================================
+    # Private: build Mamba transfer info
+    # (absorbs HeteroTPTransferConfig.__post_init__ + _validate)
+    # ============================================================
+
+    def _build_mamba_info(
+        self,
+        remote_tp_size: int,
+        remote_block_size: int,
+        remote_block_len: int,
+        remote_physical_blocks_per_logical: int,
+        local_block_len: int,
+    ) -> MambaEngineTransferInfo:
+        """Compute Mamba transfer plan."""
+        K = self.total_num_kv_heads
+        local_tp = self.tp_size
+        local_rank = self.tp_rank
+
+        is_remote_replicated = remote_tp_size > K
+        remote_physical_heads = max(1, K // remote_tp_size)
+
+        if local_tp >= remote_tp_size:
+            assert local_tp % remote_tp_size == 0
+            tp_ratio = local_tp // remote_tp_size
+        else:
+            assert remote_tp_size % local_tp == 0
+            tp_ratio = -(remote_tp_size // local_tp)
+
+        abs_tp = -tp_ratio if tp_ratio < 0 else 1
+
+        mamba_range: range | None = None
+        if tp_ratio < 0:
+            mamba_range = range(local_rank * abs_tp, (local_rank + 1) * abs_tp)
+
+        # ---- FA read targets ----
+        if self.is_mla or tp_ratio >= 0:
+            num_fa_reads = 1
+            fa_source_ranks: list[int] = (
+                [0]
+                if self.is_mla
+                else [local_rank // tp_ratio if tp_ratio > 0 else local_rank]
+            )
+        else:
+            local_needs = _physical_head_range(local_tp, K, local_rank)
+            search_range = (
+                mamba_range if mamba_range is not None else range(remote_tp_size)
+            )
+            seen: set[tuple[int, int]] = set()
+            fa_source_ranks = []
+            for p in search_range:
+                p_has = _physical_head_range(remote_tp_size, K, p)
+                ov = _range_overlap(local_needs, p_has)
+                if len(ov) > 0:
+                    key = (ov.start, ov.stop)
+                    if key not in seen:
+                        seen.add(key)
+                        fa_source_ranks.append(p)
+            if not fa_source_ranks:
+                for p in range(remote_tp_size):
+                    p_has = _physical_head_range(remote_tp_size, K, p)
+                    ov = _range_overlap(local_needs, p_has)
+                    if len(ov) > 0:
+                        key = (ov.start, ov.stop)
+                        if key not in seen:
+                            seen.add(key)
+                            fa_source_ranks.append(p)
+            num_fa_reads = len(fa_source_ranks)
+
+        # ---- All source ranks (mamba + FA) ----
+        if mamba_range is not None and abs_tp > num_fa_reads:
+            num_mamba_reads = abs_tp
+            all_source_ranks = list(mamba_range)
+        else:
+            num_mamba_reads = num_fa_reads
+            all_source_ranks = list(fa_source_ranks)
+
+        # ---- FA descriptor bytes ----
+        effective_block_len = min(local_block_len, remote_block_len)
+        if self.is_kv_layout_blocks_first:
+            fa_descriptor_bytes = effective_block_len // 2
+        else:
+            fa_descriptor_bytes = effective_block_len
+
+        # ---- Validation (from HeteroTPTransferConfig._validate) ----
+        is_local_replicated = local_tp > K
+        if is_local_replicated and is_remote_replicated and tp_ratio > 0:
+            logger.info(
+                "Both-replicated hetero-TP: local_tp=%d > remote_tp=%d > K=%d.",
+                local_tp,
+                remote_tp_size,
+                K,
+            )
+        tt_set = set(all_source_ranks)
+        for t in fa_source_ranks:
+            if t not in tt_set:
+                logger.error(
+                    "FA source rank %d NOT in all_source_ranks %s.",
+                    t,
+                    all_source_ranks,
+                )
+        if self.is_kv_layout_blocks_first and tp_ratio < 0 and num_fa_reads > 0:
+            local_k_half = local_block_len // 2
+            remote_k_half = remote_block_len // 2
+            expected = local_k_half // num_fa_reads
+            if expected != remote_k_half:
+                logger.warning(
+                    "FA size mismatch: local_k_half=%d / reads=%d = %d, "
+                    "but remote_k_half=%d.",
+                    local_k_half,
+                    num_fa_reads,
+                    expected,
+                    remote_k_half,
+                )
+
+        return MambaEngineTransferInfo(
+            remote_tp_size=remote_tp_size,
+            remote_block_len=remote_block_len,
+            remote_block_size=remote_block_size,
+            remote_physical_blocks_per_logical=(remote_physical_blocks_per_logical),
+            remote_fa_source_ranks=tuple(fa_source_ranks),
+            remote_all_source_ranks=tuple(all_source_ranks),
+            remote_num_fa_reads=num_fa_reads,
+            remote_num_mamba_reads=num_mamba_reads,
+            remote_fa_descriptor_bytes=fa_descriptor_bytes,
+            is_remote_replicated=is_remote_replicated,
+            remote_physical_heads=remote_physical_heads,
+        )
