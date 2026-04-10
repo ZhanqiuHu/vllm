@@ -1155,14 +1155,13 @@ class TransferTopology:
     # Common methods (from TpKVTopology)
     # ============================================================
 
-    def tp_ratio(self, remote_engine_id: EngineId) -> int:
+    def tp_ratio(self, remote_tp_size: int) -> int:
         """Calculate the tensor parallel ratio between local and remote TP.
 
         Positive when local_tp >= remote_tp (local workers read from the
         same remote worker in groups of size ``tp_ratio``).  Negative when
         remote_tp > local_tp (ratio is flipped).
         """
-        remote_tp_size = self._engines[remote_engine_id].remote_tp_size
         if self.tp_size >= remote_tp_size:
             assert self.tp_size % remote_tp_size == 0, (
                 f"Local tensor parallel size {self.tp_size} is not divisible "
@@ -1175,9 +1174,8 @@ class TransferTopology:
         )
         return -(remote_tp_size // self.tp_size)
 
-    def block_size_ratio(self, remote_engine_id: EngineId) -> int:
+    def block_size_ratio(self, remote_block_size: int) -> int:
         """Calculate the block size ratio between local and remote."""
-        remote_block_size = self._engines[remote_engine_id].remote_block_size
         assert self.block_size % remote_block_size == 0, (
             f"Local block size {self.block_size} is not divisible "
             f"by remote block size {remote_block_size} or vice versa."
@@ -1194,24 +1192,35 @@ class TransferTopology:
         # MLA is always replicated as the hidden dim can't be split.
         return self.is_mla or self.is_kv_replicated(remote_engine_id)
 
+    def handshake_target_ranks(self, remote_tp_size: int) -> list[int]:
+        """Pre-registration: compute which remote TP ranks to handshake with.
+
+        Pure math based on local/remote TP sizes — does not require
+        the remote engine to be registered yet.
+        """
+        tp_ratio = self.tp_ratio(remote_tp_size)
+        if tp_ratio > 0:
+            return [self.tp_rank // tp_ratio]
+        abs_ratio = -tp_ratio
+        return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
+
     def target_remote_ranks(self, remote_engine_id: EngineId) -> list[int]:
         """Get the remote TP rank(s) that the current local TP rank will
         read from.  When remote tp_size > local tp_size, reads from
         multiple remote ranks.
 
         For Mamba models, returns the precomputed ``all_source_ranks``
-        (FA + Mamba union).  (NEW: original TpKVTopology does not have
-        this Mamba branch; worker.py called transfer_config directly.)
+        (FA + Mamba union).
         """
         info = self._engines[remote_engine_id]
         if isinstance(info, MambaEngineTransferInfo):
             return list(info.remote_all_source_ranks)
 
-        ratio = self.tp_ratio(remote_engine_id)
-        if ratio > 0:
-            return [self.tp_rank // ratio]
-        # remote TP > local TP: read from |ratio| remote workers
-        abs_ratio = -ratio
+        tp_ratio = self.tp_ratio(info.remote_tp_size)
+        if tp_ratio > 0:
+            return [self.tp_rank // tp_ratio]
+        # remote TP > local TP: read from |tp_ratio| remote workers
+        abs_ratio = -tp_ratio
         return [self.tp_rank * abs_ratio + i for i in range(abs_ratio)]
 
     def get_transfer_cache_regions(
@@ -1292,10 +1301,10 @@ class TransferTopology:
         rank's first head* so it works regardless of how many heads the
         remote has.  Returns 0 when local does not index into remote.
         """
-        ratio = self.tp_ratio(remote_engine_id)
-        if self.is_mla or ratio <= 0:
-            return 0
         mamba_info = self._get_mamba_info(remote_engine_id)
+        tp_ratio = self.tp_ratio(mamba_info.remote_tp_size)
+        if self.is_mla or tp_ratio <= 0:
+            return 0
         K = self.total_num_kv_heads
         is_local_replicated = self.tp_size > K
         if is_local_replicated:
@@ -1303,7 +1312,7 @@ class TransferTopology:
             p_rank = mamba_info.remote_fa_source_ranks[0]
             p_start = p_rank * K // mamba_info.remote_tp_size
             return (local_head - p_start) * remote_kv_block_len
-        return self.tp_rank % ratio * remote_kv_block_len
+        return self.tp_rank % tp_ratio * remote_kv_block_len
 
     def needs_split_handles(self, remote_engine_id: EngineId) -> bool:
         """Whether per-remote-rank split handles are needed.
@@ -1312,9 +1321,9 @@ class TransferTopology:
         different splitting factors in the local handle.
         """
         mamba_info = self._get_mamba_info(remote_engine_id)
-        ratio = self.tp_ratio(remote_engine_id)
+        tp_ratio = self.tp_ratio(mamba_info.remote_tp_size)
         return (
-            ratio < 0
+            tp_ratio < 0
             and not self.is_mla
             and len(mamba_info.remote_all_source_ranks) > 1
         )
@@ -1380,7 +1389,7 @@ class TransferTopology:
         mamba_info = self._get_mamba_info(remote_engine_id)
         return (
             f"TransferTopology.mamba("
-            f"tp_ratio={self.tp_ratio(remote_engine_id)}, "
+            f"tp_ratio={self.tp_ratio(mamba_info.remote_tp_size)}, "
             f"K={self.total_num_kv_heads}, "
             f"local_tp={self.tp_size}, "
             f"remote_tp={mamba_info.remote_tp_size}, "
