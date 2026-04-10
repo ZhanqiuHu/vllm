@@ -55,7 +55,7 @@ KV_CONFIG=$(echo "$KV_CONFIG" | tr -d '[:space:]')
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-trap 'kill $(jobs -pr) 2>/dev/null' SIGINT SIGTERM EXIT
+trap 'kill $(jobs -pr) 2>/dev/null || true' SIGINT SIGTERM EXIT
 
 wait_for_server() {
   local port=$1
