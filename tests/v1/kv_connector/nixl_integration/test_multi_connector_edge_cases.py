@@ -85,7 +85,7 @@ def _fetch_metrics(host: str, port: str) -> dict[str, float]:
     for m in _METRIC_RE.finditer(body):
         source, val = m.group(1), float(m.group(2))
         if source in result:
-            result[source] = val
+            result[source] += val
     return result
 
 
@@ -122,7 +122,7 @@ def _fetch_offload_bytes(host: str, port: str) -> dict[str, float]:
     for m in _OFFLOAD_BYTES_RE.finditer(body):
         transfer_type, val = m.group(1), float(m.group(2))
         if transfer_type in result:
-            result[transfer_type] = val
+            result[transfer_type] += val
     return result
 
 
@@ -453,7 +453,7 @@ def test_prefill_cpu_offload_after_gpu_eviction():
     """Prefill-side: evict GPU, re-request directly, CPU offload restores KV."""
     text1, P = _complete(prefill_client, EVICTION_PROMPT, max_tokens=30)
 
-    for i in range(50):
+    for i in range(100):
         _complete(prefill_client, f"Eviction prompt number {i}: " + _make_prompt(200))
 
     ob0 = _fetch_offload_bytes(PREFILL_HOST, PREFILL_PORT)
