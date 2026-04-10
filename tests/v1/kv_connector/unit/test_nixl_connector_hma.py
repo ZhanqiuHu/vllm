@@ -532,15 +532,15 @@ def test_has_mamba_init(
         ((9216, 524288), 4096, 131),
     ],
 )
-def test_compute_mamba_phys_ratio(ssm_sizes, block_len, expected_ratio):
-    """Verify that compute_mamba_phys_ratio is TP-dependent.
+def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_ratio):
+    """Verify that compute_physical_blocks_per_logical is TP-dependent.
 
     With dimension-sharded Mamba state, the ratio differs across TP sizes
     (e.g. TP=1 → 261, TP=4 → 131 for Nemotron 30B). This is why
-    _mamba_phys_ratio must be stored per-engine.
+    _physical_blocks_per_logical must be stored per-engine.
     """
     from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
-        compute_mamba_phys_ratio,
+        compute_physical_blocks_per_logical,
     )
 
-    assert compute_mamba_phys_ratio(ssm_sizes, block_len) == expected_ratio
+    assert compute_physical_blocks_per_logical(ssm_sizes, block_len) == expected_ratio
