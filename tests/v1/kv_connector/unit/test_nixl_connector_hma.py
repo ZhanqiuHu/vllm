@@ -317,7 +317,7 @@ def test_get_block_descs_ids_hybrid_ssm():
     worker._has_mamba = True
     worker._is_mamba_group = [False, True]
     worker._physical_blocks_per_logical_kv_block = 1
-    worker._mamba_phys_ratio = {engine_id: 1}
+    worker._physical_blocks_per_logical = {engine_id: 1}
     worker.block_len_per_layer = [100]
     # num_descs = num_regions * num_blocks (no blocks_first doubling)
     worker.num_descs = 2 * num_blocks
@@ -355,7 +355,7 @@ def test_get_block_descs_ids_kernel_block_mismatch():
     worker._has_mamba = True
     worker._is_mamba_group = [False, True]
     worker._physical_blocks_per_logical_kv_block = ratio
-    worker._mamba_phys_ratio = {engine_id: ratio}
+    worker._physical_blocks_per_logical = {engine_id: ratio}
     worker.block_len_per_layer = [100]
     worker.num_descs = 2 * num_blocks  # 800
 
