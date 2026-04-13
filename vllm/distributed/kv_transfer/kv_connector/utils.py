@@ -650,32 +650,22 @@ class MambaEngineTransferInfo(EngineTransferInfo):
 # ---- Transfer topology ----
 
 
+@dataclass
 class TransferTopology:
     """Single source of truth for local TP identity and per-engine remote info."""
 
-    def __init__(
-        self,
-        tp_rank: int,
-        tp_size: int,
-        block_size: int,
-        engine_id: EngineId,
-        is_mla: bool,
-        is_mamba: bool,
-        total_num_kv_heads: int,
-        attn_backends: list[type[AttentionBackend]],
-        tensor_shape: torch.Size | None = None,
-    ):
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.block_size = block_size
-        self.engine_id = engine_id
-        self.is_mla = is_mla
-        self.is_mamba = is_mamba
-        self.total_num_kv_heads = total_num_kv_heads
-        self.attn_backends = attn_backends
-        self.tensor_shape = tensor_shape
+    tp_rank: int
+    tp_size: int
+    block_size: int
+    engine_id: EngineId
+    is_mla: bool
+    is_mamba: bool
+    total_num_kv_heads: int
+    attn_backends: list[type[AttentionBackend]]
+    tensor_shape: torch.Size | None = None
 
-        self.local_physical_heads = max(1, total_num_kv_heads // tp_size)
+    def __post_init__(self):
+        self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
         self._engines: dict[EngineId, EngineTransferInfo] = {}
         self._fa_source_sets: dict[EngineId, frozenset[int]] = {}
@@ -683,8 +673,8 @@ class TransferTopology:
 
         # Figure out whether the first dimension of the cache is K/V
         # or num_blocks.
-        attn_backend = attn_backends[0]
-        if not is_mamba:
+        attn_backend = self.attn_backends[0]
+        if not self.is_mamba:
             _MOCK_BLOCK_SIZE = 16
             kv_cache_shape: tuple[int, ...] = attn_backend.get_kv_cache_shape(
                 num_blocks=1,
@@ -696,13 +686,15 @@ class TransferTopology:
         # Non-MLA backends caches have 5 dims [2, num_blocks, H,N,D],
         # we just mock num_blocks to 1 for the dimension check below.
         # Hybrid SSM models assume a single blocks_first layout
-        self._is_kv_layout_blocks_first = is_mamba or (
+        self._is_kv_layout_blocks_first = self.is_mamba or (
             len(kv_cache_shape) == 5 and kv_cache_shape[0] == 1
         )
 
         self._cross_layers_blocks = False
-        if tensor_shape is not None:
-            self._cross_layers_blocks = len(tensor_shape) == len(kv_cache_shape) + 1
+        if self.tensor_shape is not None:
+            self._cross_layers_blocks = (
+                len(self.tensor_shape) == len(kv_cache_shape) + 1
+            )
 
         if self._cross_layers_blocks:
             logger.debug("Using cross-layer KV cache")
@@ -713,8 +705,8 @@ class TransferTopology:
                     include_num_layers_dimension=self._cross_layers_blocks
                 )
             except (AttributeError, NotImplementedError):
-                assert tensor_shape is not None
-                kv_cache_stride_order = tuple(range(len(tensor_shape)))
+                assert self.tensor_shape is not None
+                kv_cache_stride_order = tuple(range(len(self.tensor_shape)))
             kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
 
     # ============================================================
