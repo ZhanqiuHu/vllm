@@ -758,6 +758,7 @@ class TransferTopology:
                 remote_physical_blocks_per_logical=(remote_physical_blocks_per_logical),
                 local_block_len=local_block_len,
             )
+            assert isinstance(info, MambaEngineTransferInfo)
             self._fa_source_sets[remote_engine_id] = frozenset(
                 info.remote_fa_source_ranks
             )
@@ -897,18 +898,6 @@ class TransferTopology:
     # Mamba-specific methods
     # ============================================================
 
-    def _get_mamba_info(self, remote_engine_id: EngineId) -> MambaEngineTransferInfo:
-        """Retrieve Mamba per-engine info, asserting correct type."""
-        assert self.is_mamba, (
-            "Mamba transfer methods called on non-Mamba TransferTopology"
-        )
-        info = self._engines[remote_engine_id]
-        assert isinstance(info, MambaEngineTransferInfo), (
-            f"Expected MambaEngineTransferInfo for {remote_engine_id}, "
-            f"got {type(info).__name__}"
-        )
-        return info
-
     def should_skip_fa(self, remote_engine_id: EngineId, remote_rank: int) -> bool:
         """Whether to skip FA groups for this remote rank (mamba-only)."""
         return remote_rank not in self._fa_source_sets[remote_engine_id]
@@ -923,7 +912,8 @@ class TransferTopology:
         fa_index = self._fa_source_indices[remote_engine_id]
         if remote_rank in fa_index:
             return fa_index[remote_rank]
-        mamba_info = self._get_mamba_info(remote_engine_id)
+        mamba_info = self._engines[remote_engine_id]
+        assert isinstance(mamba_info, MambaEngineTransferInfo)
         K = self.total_num_kv_heads
         remote_tp = mamba_info.remote_tp_size
         r_head = _physical_head_range(remote_tp, K, remote_rank)
@@ -943,7 +933,8 @@ class TransferTopology:
         rank's first head* so it works regardless of how many heads the
         remote has.  Returns 0 when local does not index into remote.
         """
-        mamba_info = self._get_mamba_info(remote_engine_id)
+        mamba_info = self._engines[remote_engine_id]
+        assert isinstance(mamba_info, MambaEngineTransferInfo)
         tp_ratio = self.tp_ratio(mamba_info.remote_tp_size)
         if self.is_mla or tp_ratio <= 0:
             return 0
@@ -962,7 +953,8 @@ class TransferTopology:
         True when FA and mamba have different read counts, requiring
         different splitting factors in the local handle.
         """
-        mamba_info = self._get_mamba_info(remote_engine_id)
+        mamba_info = self._engines[remote_engine_id]
+        assert isinstance(mamba_info, MambaEngineTransferInfo)
         tp_ratio = self.tp_ratio(mamba_info.remote_tp_size)
         return (
             tp_ratio < 0
@@ -984,7 +976,8 @@ class TransferTopology:
         ``remote_num_fa_reads``; mamba descriptors are sliced uniformly
         by ``abs_tp``.
         """
-        mamba_info = self._get_mamba_info(remote_engine_id)
+        mamba_info = self._engines[remote_engine_id]
+        assert isinstance(mamba_info, MambaEngineTransferInfo)
         all_handle_data: list[list[tuple[int, int, int]]] = []
         for p_idx, p_rank in enumerate(mamba_info.remote_all_source_ranks):
             handle_data: list[tuple[int, int, int]] = []
@@ -1028,7 +1021,8 @@ class TransferTopology:
 
     def describe_mamba(self, remote_engine_id: EngineId) -> str:
         """One-line summary of Mamba transfer config for logging."""
-        mamba_info = self._get_mamba_info(remote_engine_id)
+        mamba_info = self._engines[remote_engine_id]
+        assert isinstance(mamba_info, MambaEngineTransferInfo)
         return (
             f"TransferTopology.mamba("
             f"tp_ratio={self.tp_ratio(mamba_info.remote_tp_size)}, "
