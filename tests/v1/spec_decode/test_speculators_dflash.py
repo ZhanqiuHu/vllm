@@ -24,7 +24,7 @@ def compute_acceptance_len(metrics) -> float:
     return 1 + (n_accepted / n_drafts)
 
 
-def test_dflash_speculators_model(vllm_runner, example_prompts):
+def test_dflash_speculators_model(vllm_runner, example_prompts, monkeypatch):
     """
     Test DFlash speculators model properly initializes speculative decoding.
 
@@ -35,6 +35,8 @@ def test_dflash_speculators_model(vllm_runner, example_prompts):
     4. Speculative tokens count is valid (num_speculative_tokens=8)
     5. Text generation works with speculative decoding enabled
     """
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
     with vllm_runner(
         MODEL_PATH, dtype=torch.bfloat16, enforce_eager=True
     ) as vllm_model:
@@ -60,7 +62,7 @@ def test_dflash_speculators_model(vllm_runner, example_prompts):
         assert vllm_outputs, f"No outputs generated for speculators model {MODEL_PATH}"
 
 
-def test_dflash_speculators_correctness():
+def test_dflash_speculators_correctness(monkeypatch):
     """
     E2E correctness test for DFlash via the speculators auto-detect path.
 
@@ -73,6 +75,8 @@ def test_dflash_speculators_correctness():
         pos 4: 0.007, pos 5: 0.002, pos 6: 0.001, pos 7: 0.000
     Observed mean AL: 1.77 (batch-size-1, magpie dataset)
     """
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
     spec_llm = LLM(
         model=MODEL_PATH,
         trust_remote_code=True,
