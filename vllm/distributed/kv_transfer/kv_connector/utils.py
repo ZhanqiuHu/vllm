@@ -593,53 +593,6 @@ def get_current_attn_backend(
     return get_current_attn_backends(vllm_config, layer_names)[0]
 
 
-# TODO (ZhanqiuHu): Consolidate TpKVTopology and HeteroTPTransferConfig
-# into a single engine-agnostic TransferTopology class.
-# 6 of 9 HeteroTPTransferConfig init fields duplicate TpKVTopology data.
-#
-# @dataclass
-# class EngineTransferInfo:
-#     """Per-remote-engine transfer state, computed at handshake."""
-#     p_tp: int
-#     tp_ratio: int
-#     p_block_len: int
-#     block_size: int
-#     # Mamba-specific (None for non-mamba models)
-#     fa_read_targets: list[int] | None = None
-#     transfer_targets: list[int] | None = None
-#     physical_fa_num_reads: int | None = None
-#     mamba_num_reads: int | None = None
-#     fa_entry_size: int | None = None
-#
-# class TransferTopology:
-#     """Single source of truth for TP topology + transfer sizing."""
-#     # Shared (set once at init, replaces duplicate fields)
-#     tp_rank: int          # == TpKVTopology.tp_rank == HeteroTP.d_rank
-#     tp_size: int          # == TpKVTopology.tp_size == HeteroTP.d_tp
-#     total_num_kv_heads: int  # == HeteroTP.K
-#     is_mla: bool          # == HeteroTP.use_mla
-#     is_mamba: bool
-#     is_blocks_first: bool # == HeteroTP.is_blocks_first
-#     d_block_len: int
-#
-#     # Per-engine (populated via register_engine() at handshake)
-#     _engines: dict[EngineId, EngineTransferInfo]
-#
-#     def register_engine(self, engine_id, p_tp, p_block_len, ...): ...
-#
-#     # General (from TpKVTopology)
-#     def tp_ratio(self, engine_id) -> int: ...
-#     def target_remote_ranks(self, engine_id) -> list[int]: ...
-#     def is_kv_replicated(self, engine_id) -> bool: ...
-#
-#     # Mamba-specific (from HeteroTPTransferConfig, gated by is_mamba)
-#     def fa_rank_offset(self, engine_id, block_len) -> int: ...
-#     def physical_fa_num_reads(self, engine_id) -> int: ...
-#     def transfer_targets(self, engine_id) -> list[int]: ...
-#     def should_skip_fa(self, engine_id, p_rank) -> bool: ...
-#     def filter_block_ids_for_rank(self, engine_id, ...) -> ...: ...
-
-
 # ---- Per-engine transfer info ----
 
 
@@ -698,12 +651,7 @@ class MambaEngineTransferInfo(EngineTransferInfo):
 
 
 class TransferTopology:
-    """Single source of truth for local TP identity and per-engine remote info.
-
-    Replaces the combination of ``TpKVTopology`` (local identity + layout
-    detection + per-engine dicts) and ``HeteroTPTransferConfig`` (Mamba
-    transfer geometry) with a single object per worker.
-    """
+    """Single source of truth for local TP identity and per-engine remote info."""
 
     def __init__(
         self,
@@ -730,11 +678,9 @@ class TransferTopology:
         self.local_physical_heads = max(1, total_num_kv_heads // tp_size)
 
         self._engines: dict[EngineId, EngineTransferInfo] = {}
-        # FA source lookup caches (Mamba only, built in register_remote_engine)
         self._fa_source_sets: dict[EngineId, frozenset[int]] = {}
         self._fa_source_indices: dict[EngineId, dict[int, int]] = {}
 
-        # ---- Layout detection (from TpKVTopology.__post_init__) ----
         # Figure out whether the first dimension of the cache is K/V
         # or num_blocks.
         attn_backend = attn_backends[0]
@@ -760,7 +706,6 @@ class TransferTopology:
 
         if self._cross_layers_blocks:
             logger.debug("Using cross-layer KV cache")
-            # prepend layers dimension
             _MOCK_NUM_LAYERS = 80
             kv_cache_shape = (_MOCK_NUM_LAYERS,) + kv_cache_shape
             try:
@@ -770,8 +715,6 @@ class TransferTopology:
             except (AttributeError, NotImplementedError):
                 assert tensor_shape is not None
                 kv_cache_stride_order = tuple(range(len(tensor_shape)))
-            # In case of cross layers permute kv_cache_shape according to
-            # stride_order to retrieve physical position of block_size
             kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
 
     # ============================================================
@@ -835,7 +778,7 @@ class TransferTopology:
         return self._engines[remote_engine_id]
 
     # ============================================================
-    # Layout properties (from TpKVTopology)
+    # Layout properties
     # ============================================================
 
     @property
@@ -854,7 +797,7 @@ class TransferTopology:
         )
 
     # ============================================================
-    # Common methods (from TpKVTopology)
+    # Common methods
     # ============================================================
 
     def tp_ratio(self, remote_tp_size: int) -> int:
@@ -951,10 +894,7 @@ class TransferTopology:
         return cache if self.split_k_and_v else [cache]
 
     # ============================================================
-    # Mamba-specific (from HeteroTPTransferConfig)
-    #
-    # These methods will move to MambaModelBlockTransferPolicy in a
-    # future refactor (Phase 2).
+    # Mamba-specific methods
     # ============================================================
 
     def _get_mamba_info(self, remote_engine_id: EngineId) -> MambaEngineTransferInfo:
@@ -1106,7 +1046,6 @@ class TransferTopology:
 
     # ============================================================
     # Private: build Mamba transfer info
-    # (absorbs HeteroTPTransferConfig.__post_init__ + _validate)
     # ============================================================
 
     def _build_mamba_info(
@@ -1187,7 +1126,7 @@ class TransferTopology:
         else:
             fa_descriptor_bytes = effective_block_len
 
-        # ---- Validation (from HeteroTPTransferConfig._validate) ----
+        # ---- Validation ----
         is_local_replicated = local_tp > K
         if is_local_replicated and is_remote_replicated and tp_ratio > 0:
             logger.info(
