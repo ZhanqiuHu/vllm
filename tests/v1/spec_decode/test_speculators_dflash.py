@@ -38,7 +38,10 @@ def test_dflash_speculators_model(vllm_runner, example_prompts, monkeypatch):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     with vllm_runner(
-        MODEL_PATH, dtype=torch.bfloat16, enforce_eager=True
+        MODEL_PATH,
+        dtype=torch.bfloat16,
+        enforce_eager=True,
+        quantization="fp8",
     ) as vllm_model:
         vllm_config = vllm_model.llm.llm_engine.vllm_config
 
@@ -84,6 +87,7 @@ def test_dflash_speculators_correctness(monkeypatch):
         max_num_seqs=128,
         gpu_memory_utilization=0.85,
         enforce_eager=False,
+        quantization="fp8",
         disable_log_stats=False,
     )
 
