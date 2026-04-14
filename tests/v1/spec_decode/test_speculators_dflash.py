@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
 import torch
 
 from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
+from tests.utils import large_gpu_mark
 from vllm import LLM
 from vllm.config import SpeculativeConfig
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -65,6 +67,8 @@ def test_dflash_speculators_model(vllm_runner, example_prompts, monkeypatch):
         assert vllm_outputs, f"No outputs generated for speculators model {MODEL_PATH}"
 
 
+@pytest.mark.slow_test
+@large_gpu_mark(min_gb=40)
 def test_dflash_speculators_correctness(monkeypatch):
     """
     E2E correctness test for DFlash via the speculators auto-detect path.
@@ -87,7 +91,6 @@ def test_dflash_speculators_correctness(monkeypatch):
         max_num_seqs=128,
         gpu_memory_utilization=0.85,
         enforce_eager=False,
-        quantization="fp8",
         disable_log_stats=False,
     )
 
