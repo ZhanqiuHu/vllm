@@ -523,8 +523,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
-        target_vocab_size = vllm_config.model_config.hf_config.vocab_size
-        if self.config.draft_vocab_size != target_vocab_size:
+        target_vocab_size = getattr(
+            vllm_config.model_config.hf_config, "vocab_size", None
+        )
+        if (
+            target_vocab_size is not None
+            and self.config.draft_vocab_size != target_vocab_size
+        ):
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
                 requires_grad=False,
