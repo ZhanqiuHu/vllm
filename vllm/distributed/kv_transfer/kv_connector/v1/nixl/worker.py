@@ -1174,7 +1174,7 @@ class NixlConnectorWorker:
             remote_block_size=nixl_agent_meta.block_size,
             remote_block_len=nixl_agent_meta.block_lens[0],
             remote_physical_blocks_per_logical=physical_blocks_per_logical,
-            local_block_len=(self.block_len_per_layer[0] if self._has_mamba else 0),
+            local_block_len=self.block_len_per_layer[0],
         )
         if self._has_mamba and engine_id not in self._physical_blocks_per_logical:
             self._physical_blocks_per_logical[engine_id] = physical_blocks_per_logical
