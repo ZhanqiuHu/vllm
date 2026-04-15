@@ -152,13 +152,14 @@ def test_read_blocks_for_req_expands_remote_ids(
 
     remote_engine_id = "remote-engine"
     if has_mamba:
-        worker._mamba_phys_ratio = {remote_engine_id: remote_ratio}
+        worker._physical_blocks_per_logical = {remote_engine_id: remote_ratio}
 
-    # Mock kv_topo: empty remote ranks skips the transfer machinery entirely,
-    # isolating the block-ID expansion logic.
-    worker.kv_topo = MagicMock()
-    worker.kv_topo.get_target_remote_ranks_from_engine_id.return_value = []
-    worker.kv_topo.tp_ratio_from_engine_id.return_value = 1
+    # Mock transfer_topo: empty remote ranks skips the transfer machinery
+    # entirely, isolating the block-ID expansion logic.
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.target_remote_ranks.return_value = []
+    worker.transfer_topo.get_engine_info.return_value = MagicMock(remote_tp_size=1)
+    worker.transfer_topo.tp_ratio.return_value = 1
 
     metadata = NixlConnectorMetadata()
     metadata.add_new_req_to_recv(
