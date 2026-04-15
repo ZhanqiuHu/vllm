@@ -47,6 +47,7 @@ steps:
   timeout_in_minutes: 30
   gpu: h100
   optional: true
+  num_gpus: 1
   source_file_dependencies:
     - vllm/v1/spec_decode/
     - vllm/model_executor/models/qwen3_dflash.py
