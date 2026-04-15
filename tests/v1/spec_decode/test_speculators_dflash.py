@@ -13,7 +13,7 @@ MODEL_PATH = "nm-testing/dflash-qwen3-8b-speculators"
 
 EXPECTED_GSM8K_ACCURACY = 0.885
 ACCURACY_RTOL = 0.03
-EXPECTED_ACCEPTANCE_LEN = 1.84
+EXPECTED_ACCEPTANCE_LEN = 3.45
 ACCEPTANCE_LEN_RTOL = 0.15
 
 
@@ -77,10 +77,10 @@ def test_dflash_speculators_correctness(monkeypatch):
     correct outputs, and checks that acceptance length does not collapse under
     batched inference (lm-eval style).
 
-    Observed per-position acceptance rates on magpie (200 prompts):
-        pos 0: 0.478, pos 1: 0.181, pos 2: 0.069, pos 3: 0.023,
-        pos 4: 0.007, pos 5: 0.002, pos 6: 0.001, pos 7: 0.000
-    Observed mean AL: 1.77 (batch-size-1, magpie dataset)
+    Observed per-position acceptance rates on GSM8K (1319 questions, 5-shot):
+        pos 0: 0.794, pos 1: 0.610, pos 2: 0.428, pos 3: 0.282,
+        pos 4: 0.169, pos 5: 0.094, pos 6: 0.048, pos 7: 0.023
+    Observed mean AL: 3.45 (batched, GSM8K 5-shot)
     """
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -97,14 +97,17 @@ def test_dflash_speculators_correctness(monkeypatch):
     results = evaluate_gsm8k_offline(spec_llm)
     accuracy = results["accuracy"]
     accuracy_threshold = EXPECTED_GSM8K_ACCURACY * (1 - ACCURACY_RTOL)
-    assert accuracy >= accuracy_threshold, (
-        f"Expected GSM8K accuracy >= {accuracy_threshold:.3f}, got {accuracy:.3f}"
-    )
 
     current_metrics = spec_llm.get_metrics()
     acceptance_len = compute_acceptance_len(current_metrics)
-
     al_threshold = EXPECTED_ACCEPTANCE_LEN * (1 - ACCEPTANCE_LEN_RTOL)
+
+    print(f"GSM8K accuracy: {accuracy:.3f} (threshold: {accuracy_threshold:.3f})")
+    print(f"Acceptance length: {acceptance_len:.2f} (threshold: {al_threshold:.2f})")
+
+    assert accuracy >= accuracy_threshold, (
+        f"Expected GSM8K accuracy >= {accuracy_threshold:.3f}, got {accuracy:.3f}"
+    )
     assert acceptance_len >= al_threshold, (
         f"DFlash speculators acceptance length too low: "
         f"{acceptance_len:.2f} < {al_threshold:.2f}"
