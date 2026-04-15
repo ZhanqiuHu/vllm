@@ -692,9 +692,9 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
         # Override TP rank/size to simulate P TP=2
         prefill_worker.tp_rank = P_TP_RANK
         prefill_worker.tp_size = P_TP_SIZE
-        # Update shared dict so kv_topo sees correct TP size
         prefill_worker._tp_size[prefill_worker.engine_id] = P_TP_SIZE
-        prefill_worker.kv_topo.tp_rank = P_TP_RANK
+        prefill_worker.transfer_topo.tp_rank = P_TP_RANK
+        prefill_worker.transfer_topo.tp_size = P_TP_SIZE
 
         prefill_worker.kv_caches_base_addr = [0x1000]
         prefill_worker.block_len_per_layer = [local_block_len]
@@ -714,7 +714,7 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
         send_meta.ready.set()
 
         # Compute target D ranks using the production code path
-        target_d_ranks = prefill_worker.kv_topo.get_target_remote_ranks(d_tp_size)
+        target_d_ranks = prefill_worker.transfer_topo.handshake_target_ranks(d_tp_size)
 
         mock_socket = AsyncMock(spec=zmq.asyncio.Socket)
         mock_socket.send_multipart = AsyncMock()
