@@ -319,38 +319,6 @@ def yield_req_data(
     )
 
 
-# ---- Mamba-HMA hetero-TP transfer config ----
-#
-# Key insight: with hetero-TP (P_TP > D_TP), FA KV cache may be
-# replicated across P ranks (when P_TP > num_kv_heads), but Mamba
-# conv/SSM state is almost always uniquely sharded per P rank.  So the
-# number of P ranks D must read from can differ between FA and Mamba,
-# and they must be handled separately.
-
-
-def _physical_head_range(tp_size: int, num_heads: int, rank: int) -> range:
-    """Physical KV head range stored in a rank's KV cache tensor.
-
-    When ``tp_size <= num_heads``: sharded, K/TP contiguous heads per rank.
-    When ``tp_size > num_heads``: 1 physical head per rank.  Heads are
-    distributed **contiguously** (matching vLLM's GQA weight partitioning):
-    consecutive ranks share a head before moving to the next one.
-    """
-    if tp_size <= num_heads:
-        assert num_heads % tp_size == 0
-        per_rank = num_heads // tp_size
-        return range(rank * per_rank, (rank + 1) * per_rank)
-    else:
-        h = rank * num_heads // tp_size
-        return range(h, h + 1)
-
-
-def _range_overlap(a: range, b: range) -> range:
-    start = max(a.start, b.start)
-    stop = min(a.stop, b.stop)
-    return range(start, max(start, stop))
-
-
 def get_current_attn_backends(
     vllm_config: VllmConfig, layer_names: list[str] | None = None
 ) -> list[type[AttentionBackend]]:
@@ -513,7 +481,7 @@ class TransferTopology:
             kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
 
     # ============================================================
-    # Engine registration (new)
+    # Engine registration
     # ============================================================
 
     def register_remote_engine(
@@ -526,7 +494,7 @@ class TransferTopology:
         *,
         local_block_len: int = 0,
     ) -> EngineTransferInfo:
-        """Register a remote engine, replacing scattered worker dicts.
+        """Register a remote engine, unifying worker dicts state.
 
         Only remote engines should be registered here — the local engine's
         identity (tp_size, block_size, etc.) is set via ``__init__`` params.
@@ -716,10 +684,10 @@ class TransferTopology:
         assert isinstance(mamba_info, MambaEngineTransferInfo)
         K = self.total_num_kv_heads
         remote_tp = mamba_info.remote_tp_size
-        r_head = _physical_head_range(remote_tp, K, remote_rank)
+        r_head = self._physical_head_range(remote_tp, K, remote_rank)
         for target in mamba_info.remote_fa_source_ranks:
-            t_head = _physical_head_range(remote_tp, K, target)
-            if _range_overlap(r_head, t_head):
+            t_head = self._physical_head_range(remote_tp, K, target)
+            if self._range_overlap(r_head, t_head):
                 return fa_index[target]
         return 0
 
@@ -819,24 +787,60 @@ class TransferTopology:
         ]
         return filtered_local, filtered_remote
 
-    def describe_mamba(self, remote_engine_id: EngineId) -> str:
-        """One-line summary of Mamba transfer config for logging."""
-        mamba_info = self._engines[remote_engine_id]
-        assert isinstance(mamba_info, MambaEngineTransferInfo)
-        return (
-            f"TransferTopology.mamba("
-            f"tp_ratio={self.tp_ratio(mamba_info.remote_tp_size)}, "
+    def describe(self, remote_engine_id: EngineId) -> str:
+        """One-line summary of transfer config for logging."""
+        info = self._engines[remote_engine_id]
+        base = (
+            f"tp_ratio={self.tp_ratio(info.remote_tp_size)}, "
             f"K={self.total_num_kv_heads}, "
             f"local_tp={self.tp_size}, "
-            f"remote_tp={mamba_info.remote_tp_size}, "
+            f"remote_tp={info.remote_tp_size}, "
             f"local_rank={self.tp_rank}, "
-            f"fa_reads={mamba_info.remote_num_fa_reads}, "
-            f"mamba_reads={mamba_info.remote_num_mamba_reads}, "
-            f"fa_sources={list(mamba_info.remote_fa_source_ranks)}, "
-            f"all_sources={list(mamba_info.remote_all_source_ranks)}, "
-            f"fa_desc_bytes={mamba_info.remote_fa_descriptor_bytes}, "
-            f"remote_block_len={mamba_info.remote_block_len})"
+            f"remote_block_len={info.remote_block_len}"
         )
+        if isinstance(info, MambaEngineTransferInfo):
+            return (
+                f"TransferTopology.mamba({base}, "
+                f"fa_reads={info.remote_num_fa_reads}, "
+                f"mamba_reads={info.remote_num_mamba_reads}, "
+                f"fa_sources={list(info.remote_fa_source_ranks)}, "
+                f"all_sources={list(info.remote_all_source_ranks)}, "
+                f"fa_desc_bytes={info.remote_fa_descriptor_bytes})"
+            )
+        return f"TransferTopology({base})"
+
+    # ============================================================
+    # Private helpers
+    # ============================================================
+    # Mamba-HMA hetero-TP transfer config:
+    # With hetero-TP (P_TP > D_TP), FA KV cache may be replicated across
+    # P ranks (when P_TP > num_kv_heads), but Mamba conv/SSM state is
+    # almost always uniquely sharded per P rank.  So the number of P
+    # ranks D must read from can differ between FA and Mamba, and they
+    # must be handled separately.
+
+    @staticmethod
+    def _physical_head_range(tp_size: int, num_heads: int, rank: int) -> range:
+        """Physical KV head range stored in a rank's KV cache tensor.
+
+        When ``tp_size <= num_heads``: sharded, K/TP contiguous heads per rank.
+        When ``tp_size > num_heads``: 1 physical head per rank.  Heads are
+        distributed **contiguously** (matching vLLM's GQA weight partitioning):
+        consecutive ranks share a head before moving to the next one.
+        """
+        if tp_size <= num_heads:
+            assert num_heads % tp_size == 0
+            per_rank = num_heads // tp_size
+            return range(rank * per_rank, (rank + 1) * per_rank)
+        else:
+            h = rank * num_heads // tp_size
+            return range(h, h + 1)
+
+    @staticmethod
+    def _range_overlap(a: range, b: range) -> range:
+        start = max(a.start, b.start)
+        stop = min(a.stop, b.stop)
+        return range(start, max(start, stop))
 
     # ============================================================
     # Private: build Mamba transfer info
@@ -880,15 +884,15 @@ class TransferTopology:
                 else [local_rank // tp_ratio if tp_ratio > 0 else local_rank]
             )
         else:
-            local_needs = _physical_head_range(local_tp, K, local_rank)
+            local_needs = self._physical_head_range(local_tp, K, local_rank)
             search_range = (
                 mamba_range if mamba_range is not None else range(remote_tp_size)
             )
             seen: set[tuple[int, int]] = set()
             fa_source_ranks = []
             for p in search_range:
-                p_has = _physical_head_range(remote_tp_size, K, p)
-                ov = _range_overlap(local_needs, p_has)
+                p_has = self._physical_head_range(remote_tp_size, K, p)
+                ov = self._range_overlap(local_needs, p_has)
                 if len(ov) > 0:
                     key = (ov.start, ov.stop)
                     if key not in seen:
@@ -896,8 +900,8 @@ class TransferTopology:
                         fa_source_ranks.append(p)
             if not fa_source_ranks:
                 for p in range(remote_tp_size):
-                    p_has = _physical_head_range(remote_tp_size, K, p)
-                    ov = _range_overlap(local_needs, p_has)
+                    p_has = self._physical_head_range(remote_tp_size, K, p)
+                    ov = self._range_overlap(local_needs, p_has)
                     if len(ov) > 0:
                         key = (ov.start, ov.stop)
                         if key not in seen:

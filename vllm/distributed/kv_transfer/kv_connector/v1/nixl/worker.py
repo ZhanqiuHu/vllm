@@ -1178,10 +1178,8 @@ class NixlConnectorWorker:
         )
         if self._has_mamba and engine_id not in self._physical_blocks_per_logical:
             self._physical_blocks_per_logical[engine_id] = physical_blocks_per_logical
-            logger.info(
-                "Mamba transfer plan: %s",
-                transfer_topo.describe_mamba(engine_id),
-            )
+
+        logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1247,15 +1245,9 @@ class NixlConnectorWorker:
                         )
                         self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
 
-                    mamba_info = transfer_topo.get_engine_info(engine_id)
-                    assert isinstance(mamba_info, MambaEngineTransferInfo)
                     logger.info(
-                        "Mamba-HMA split handles: targets=%s, fa_reads=%s, "
-                        "fa_entry=%s, mamba_reads=%s, num_descs=%s",
-                        mamba_info.remote_all_source_ranks,
-                        mamba_info.remote_num_fa_reads,
-                        mamba_info.remote_fa_descriptor_bytes,
-                        mamba_info.remote_num_mamba_reads,
+                        "Mamba-HMA split handles: %s, num_descs=%s",
+                        transfer_topo.describe(engine_id),
                         self.num_descs,
                     )
             else:
