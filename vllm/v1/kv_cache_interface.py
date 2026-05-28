@@ -250,6 +250,31 @@ class KVCacheSpec:
             f"{type(self).__name__} does not implement get_tp_transfer_slices"
         )
 
+    def slice_for_tp_transfer(
+        self,
+        src_tensor: torch.Tensor,
+        src_tp_size: int,
+        src_tp_rank: int,
+        dst_spec: KVCacheSpec,
+        dst_tp_size: int,
+        dst_tp_rank: int,
+    ) -> list[torch.Tensor]:
+        """Return slices of *src_tensor* to transfer from src to dst.
+
+        Called on the **source** spec.  *src_tensor* has the per-layer
+        logical shape ``[B, H, N, C]`` (RFC #42082) and may be a
+        ``device='meta'`` tensor used only for offset planning.
+
+        Returns a list of tensor views (possibly empty if this source
+        rank has no data for the destination rank).  Each view is a
+        contiguous slice along the H (heads) dimension.
+
+        Subclasses must override this method.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement slice_for_tp_transfer"
+        )
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -378,6 +403,41 @@ class AttentionSpec(KVCacheSpec):
                 )
 
             return result
+
+    def slice_for_tp_transfer(
+        self,
+        src_tensor: torch.Tensor,
+        src_tp_size: int,
+        src_tp_rank: int,
+        dst_spec: KVCacheSpec,
+        dst_tp_size: int,
+        dst_tp_rank: int,
+    ) -> list[torch.Tensor]:
+        """GQA head-based slicing along the H dimension.
+
+        Handles all TP ratio combinations (D>P, P>D, homo) and GQA
+        replication.  src_tensor shape: [B, H, N, C].
+        """
+        assert isinstance(dst_spec, AttentionSpec)
+        total_heads = src_tp_size * self.num_kv_heads
+        dst_total = dst_tp_size * dst_spec.num_kv_heads
+
+        if dst_total > total_heads:
+            dst_tp_rank = dst_tp_rank % src_tp_size
+
+        src_start = src_tp_rank * self.num_kv_heads
+        src_end = src_start + self.num_kv_heads
+        dst_start = dst_tp_rank * dst_spec.num_kv_heads
+        dst_end = dst_start + dst_spec.num_kv_heads
+
+        lo = max(src_start, dst_start)
+        hi = min(src_end, dst_end)
+        if lo >= hi:
+            return []
+
+        local_lo = lo - src_start
+        local_hi = hi - src_start
+        return [src_tensor[:, local_lo:local_hi, :, :]]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -568,6 +628,21 @@ class MLAAttentionSpec(FullAttentionSpec):
             )
         }
 
+    def slice_for_tp_transfer(
+        self,
+        src_tensor: torch.Tensor,
+        src_tp_size: int,
+        src_tp_rank: int,
+        dst_spec: KVCacheSpec,
+        dst_tp_size: int,
+        dst_tp_rank: int,
+    ) -> list[torch.Tensor]:
+        """MLA cache is fully replicated -- return full tensor from aligned rank."""
+        aligned = dst_tp_rank * src_tp_size // dst_tp_size
+        if src_tp_rank != aligned:
+            return []
+        return [src_tensor]
+
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
@@ -755,6 +830,21 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             )
         }
 
+    def slice_for_tp_transfer(
+        self,
+        src_tensor: torch.Tensor,
+        src_tp_size: int,
+        src_tp_rank: int,
+        dst_spec: KVCacheSpec,
+        dst_tp_size: int,
+        dst_tp_rank: int,
+    ) -> list[torch.Tensor]:
+        """MLA cache is fully replicated -- return full tensor from aligned rank."""
+        aligned = dst_tp_rank * src_tp_size // dst_tp_size
+        if src_tp_rank != aligned:
+            return []
+        return [src_tensor]
+
     @property
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
@@ -865,6 +955,114 @@ class MambaSpec(KVCacheSpec):
                 )
                 for r in range(start, start + abs_tp)
             }
+
+    # TODO(RFC #42082): consolidate with derive_mamba_conv_split in
+    # ssm_conv_transfer_utils.py — this duplicates the decomposition logic
+    # so the spec can produce tensor slices without depending on the connector.
+    @staticmethod
+    def _derive_conv_proj_dims(
+        shapes: tuple[tuple[int, ...], ...],
+        mamba_type: MambaAttentionBackendEnum,
+        local_tp: int,
+    ) -> tuple[tuple[int, int, int], int]:
+        """Decompose conv dim into per-rank sub-projection column counts.
+
+        Returns (proj_dims, conv_rows) where proj_dims = (p0, p1, p2)
+        are per-rank column counts for each sub-projection.
+        """
+        conv_shape = shapes[0]
+        local_conv_dim = conv_shape[0]
+        conv_rows = conv_shape[1]
+
+        if mamba_type == MambaAttentionBackendEnum.MAMBA2:
+            head_dim = shapes[1][1]
+            local_num_heads = shapes[1][0]
+            intermediate_size = local_num_heads * local_tp * head_dim
+            remainder = local_conv_dim * local_tp - intermediate_size
+            groups_ss = remainder // 2
+            x_local = intermediate_size // local_tp
+            b_local = groups_ss // local_tp
+            proj_dims = (x_local, b_local, b_local)
+        elif mamba_type == MambaAttentionBackendEnum.GDN_ATTN:
+            # TODO should we do a GDNMambaSpec?
+            num_v_heads_local = shapes[1][0]
+            head_v_dim = shapes[1][1]
+            value_dim_local = num_v_heads_local * head_v_dim
+            key_dim_local = (local_conv_dim - value_dim_local) // 2
+            proj_dims = (key_dim_local, key_dim_local, value_dim_local)
+        else:
+            raise NotImplementedError(
+                f"Conv split not supported for mamba_type={mamba_type!r}"
+            )
+        return proj_dims, conv_rows
+
+    def slice_for_tp_transfer(
+        self,
+        src_tensor: torch.Tensor,
+        src_tp_size: int,
+        src_tp_rank: int,
+        dst_spec: KVCacheSpec,
+        dst_tp_size: int,
+        dst_tp_rank: int,
+    ) -> list[torch.Tensor]:
+        """Mamba state: return 4 slices (3 conv sub-projections + SSM).
+
+        Slices the C dimension of src_tensor [B, 1, 1, C] into the
+        sub-projection regions that the destination rank needs.
+        """
+        assert isinstance(dst_spec, MambaSpec)
+
+        if dst_tp_size >= src_tp_size:
+            aligned = dst_tp_rank * src_tp_size // dst_tp_size
+            if src_tp_rank != aligned:
+                return []
+            tp_ratio = dst_tp_size // src_tp_size
+            local_rank_offset = dst_tp_rank % tp_ratio
+        else:
+            abs_tp = src_tp_size // dst_tp_size
+            start = dst_tp_rank * abs_tp
+            if not (start <= src_tp_rank < start + abs_tp):
+                return []
+            tp_ratio = -(src_tp_size // dst_tp_size)
+            local_rank_offset = 0
+
+        src_proj, src_rows = self._derive_conv_proj_dims(
+            self.shapes, self.mamba_type, src_tp_size
+        )
+        src_conv_elements = sum(d * src_rows for d in src_proj)
+        src_ssm_elements = prod(self.shapes[1])
+
+        slices: list[torch.Tensor] = []
+
+        if tp_ratio >= 1:
+            dst_proj, _ = self._derive_conv_proj_dims(
+                dst_spec.shapes, dst_spec.mamba_type, dst_tp_size
+            )
+            cursor = 0
+            for i in range(3):
+                dst_elems = dst_proj[i] * src_rows
+                off = cursor + local_rank_offset * dst_elems
+                slices.append(src_tensor[:, :, :, off : off + dst_elems])
+                cursor += src_proj[i] * src_rows
+
+            dst_ssm_elements = prod(dst_spec.shapes[1])
+            ssm_off = src_conv_elements + local_rank_offset * dst_ssm_elements
+            slices.append(src_tensor[:, :, :, ssm_off : ssm_off + dst_ssm_elements])
+        else:
+            abs_ratio = -tp_ratio
+            cursor = 0
+            for i in range(3):
+                proj_elems = src_proj[i] * src_rows
+                remote_elems = proj_elems // abs_ratio
+                slices.append(src_tensor[:, :, :, cursor : cursor + remote_elems])
+                cursor += proj_elems
+
+            remote_ssm = src_ssm_elements // abs_ratio
+            slices.append(
+                src_tensor[:, :, :, src_conv_elements : src_conv_elements + remote_ssm]
+            )
+
+        return slices
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
