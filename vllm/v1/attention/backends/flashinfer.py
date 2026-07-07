@@ -1584,7 +1584,7 @@ class FlashInferImpl(AttentionImpl):
         if query.dtype != q_data_type:
             assert query.dtype in [torch.float16, torch.bfloat16]
             assert q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]
-            assert query.is_contiguous()
+            query = query.contiguous()
             assert query.dim() == 3
             num_tokens = query.shape[0]
             num_heads = query.shape[1]
