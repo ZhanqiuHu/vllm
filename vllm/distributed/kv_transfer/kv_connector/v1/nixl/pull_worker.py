@@ -166,7 +166,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self.use_mla and tp_ratio < 0:
             assert len(read_specs) == 1
 
-        for i, spec in enumerate(read_specs):
+        for spec in read_specs:
             remote_block_size = remote_info.remote_block_size
             logger.debug(
                 "Remote agent %s available, calling _read_blocks"
@@ -177,13 +177,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
             )
             # Get side handles.
-            local_xfer_side_handle = self._get_local_xfer_side_handle(
-                meta.remote.engine_id,
-                spec.remote_rank,
-                remote_block_size,
-                tp_ratio,
-                i,
-            )
+            local_xfer_side_handle = self.src_xfer_handles_by_remote[
+                meta.remote.engine_id
+            ][spec.remote_rank]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][

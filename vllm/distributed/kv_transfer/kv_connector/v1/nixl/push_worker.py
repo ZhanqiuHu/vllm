@@ -547,7 +547,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             ]
 
         handles: list[int] = []
-        for i, spec in enumerate(read_specs):
+        for spec in read_specs:
             remote_block_size = remote_info.remote_block_size
             logger.debug(
                 "Remote agent %s available, calling _xfer_blocks"
@@ -557,13 +557,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_size,
                 req_id,
             )
-            local_xfer_side_handle = self._get_local_xfer_side_handle(
-                meta.remote.engine_id,
-                spec.remote_rank,
-                remote_block_size,
-                tp_ratio,
-                i,
-            )
+            local_xfer_side_handle = self.src_xfer_handles_by_remote[
+                meta.remote.engine_id
+            ][spec.remote_rank]
 
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
                 spec.remote_rank

@@ -43,28 +43,53 @@ def build_region_meta(
     block_stride_bytes: int,
     region_content_bytes: int,
     kv_cache_layout: str = "HND",
+    layers_per_region: int = 1,
 ) -> torch.Tensor:
     """Build a ``(B, H, N, C)`` metadata tensor for a cache region."""
     dtype = getattr(spec, "dtype", torch.int8)
     elem = get_dtype_size(dtype)
     num_heads, num_tokens, content_dim = spec.compute_transfer_shape(
-        region_content_bytes, block_size
+        region_content_bytes // layers_per_region, block_size
     )
-    if kv_cache_layout in ("NHD", "NHC"):
+    size: tuple[int, ...]
+    inner_strides: tuple[int, ...]
+    if layers_per_region > 1 and kv_cache_layout in ("NHD", "NHC"):
+        size = (
+            num_blocks,
+            num_heads,
+            layers_per_region,
+            num_tokens,
+            content_dim,
+        )
         inner_strides = (
             content_dim,
+            num_tokens * num_heads * content_dim,
             num_heads * content_dim,
             1,
         )
-    else:
+    elif layers_per_region > 1:
+        size = (
+            num_blocks,
+            num_heads,
+            layers_per_region,
+            num_tokens,
+            content_dim,
+        )
         inner_strides = (
+            layers_per_region * num_tokens * content_dim,
             num_tokens * content_dim,
             content_dim,
             1,
         )
+    elif kv_cache_layout in ("NHD", "NHC"):
+        size = (num_blocks, num_heads, num_tokens, content_dim)
+        inner_strides = (content_dim, num_heads * content_dim, 1)
+    else:
+        size = (num_blocks, num_heads, num_tokens, content_dim)
+        inner_strides = (num_tokens * content_dim, content_dim, 1)
     return torch.as_strided(
         torch.empty(1, dtype=dtype, device="meta"),
-        size=(num_blocks, num_heads, num_tokens, content_dim),
+        size=size,
         stride=(block_stride_bytes // elem, *inner_strides),
         storage_offset=0,
     )
@@ -123,6 +148,16 @@ def jointly_contiguous_chunks(
         yield pending
 
 
+def _stack_nixl_descriptors(
+    addrs: np.ndarray, length: int, device_id: int
+) -> np.ndarray:
+    descriptors = np.empty((addrs.shape[0], 3), dtype=np.uint64)
+    descriptors[:, 0] = addrs
+    descriptors[:, 1] = length
+    descriptors[:, 2] = device_id
+    return descriptors
+
+
 class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
     """Build matching local and remote descriptor lists during handshake."""
 
@@ -133,7 +168,6 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        self._descs_per_block_per_group: tuple[int, ...] = ()
 
     def _group_specs(self) -> list[KVCacheSpec]:
         specs: list[KVCacheSpec] = []
@@ -155,11 +189,11 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
 
     def _group_num_blocks(
         self,
-        spec: KVCacheSpec,
+        spec_type: type[KVCacheSpec],
         kernel_num_blocks: int,
         physical_blocks_per_logical: int,
     ) -> int:
-        if isinstance(spec, MambaSpec):
+        if issubclass(spec_type, MambaSpec):
             return kernel_num_blocks // physical_blocks_per_logical
         return kernel_num_blocks
 
@@ -171,16 +205,8 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         physical_blocks_per_logical: int,
         descs_per_block_per_group: tuple[int, ...] | None = None,
     ) -> np.ndarray:
-        layout = descs_per_block_per_group or self._descs_per_block_per_group
-        if self._is_packed_kv or not layout:
-            return super()._compute_desc_ids(
-                block_ids,
-                dst_num_blocks,
-                block_size_ratio,
-                physical_blocks_per_logical,
-                descs_per_block_per_group,
-            )
-
+        assert descs_per_block_per_group is not None
+        layout = descs_per_block_per_group
         assert len(layout) == len(block_ids)
         kernel_num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -188,11 +214,11 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
 
         offset = 0
         all_descs: list[np.ndarray] = []
-        for group_idx, (spec, group_block_ids) in enumerate(
-            zip(self._group_specs(), block_ids)
-        ):
+        for group_idx, group_block_ids in enumerate(block_ids):
             num_blocks = self._group_num_blocks(
-                spec, kernel_num_blocks, physical_blocks_per_logical
+                self._group_spec_types[group_idx],
+                kernel_num_blocks,
+                physical_blocks_per_logical,
             )
             num_streams = layout[group_idx]
             all_descs.append(
@@ -206,25 +232,6 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         return np.concatenate(all_descs)
 
     @staticmethod
-    def _view_to_nixl_descriptors(
-        view: torch.Tensor,
-        base_addr: int,
-        device_id: int,
-    ) -> np.ndarray:
-        block_stride = view.stride(_DIM4_B) * view.element_size()
-        block_offsets = np.arange(view.shape[_DIM4_B], dtype=np.uint64) * block_stride
-        parts: list[np.ndarray] = []
-        for offset, _, length in jointly_contiguous_chunks(view, view):
-            parts.append(
-                NixlBaseConnectorWorker._stack_descs(
-                    base_addr + offset + block_offsets,
-                    length,
-                    device_id,
-                )
-            )
-        return np.concatenate(parts)
-
-    @staticmethod
     def _views_to_nixl_descriptors(
         local_view: torch.Tensor,
         remote_view: torch.Tensor,
@@ -233,30 +240,72 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         local_device_id: int,
         remote_device_id: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        local_block_stride = local_view.stride(_DIM4_B) * local_view.element_size()
+        return NixlBaseConnectorWorkerMultiview._mapped_views_to_nixl_descriptors(
+            [local_view],
+            remote_view,
+            local_base_addr,
+            remote_base_addr,
+            local_device_id,
+            remote_device_id,
+        )
+
+    @staticmethod
+    def _mapped_views_to_nixl_descriptors(
+        local_views: list[torch.Tensor],
+        remote_view: torch.Tensor,
+        local_base_addr: int,
+        remote_base_addr: int,
+        local_device_id: int,
+        remote_device_id: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert local_views
+        local_num_blocks = local_views[0].shape[_DIM4_B]
+        assert all(view.shape[_DIM4_B] == local_num_blocks for view in local_views)
+        local_block_stride = (
+            local_views[0].stride(_DIM4_B) * local_views[0].element_size()
+        )
         remote_block_stride = remote_view.stride(_DIM4_B) * remote_view.element_size()
         local_block_offsets = (
-            np.arange(local_view.shape[_DIM4_B], dtype=np.uint64) * local_block_stride
+            np.arange(local_num_blocks, dtype=np.uint64) * local_block_stride
         )
         remote_block_offsets = (
             np.arange(remote_view.shape[_DIM4_B], dtype=np.uint64) * remote_block_stride
         )
-        assert len(local_block_offsets) == len(remote_block_offsets)
+
+        chunks_per_subblock = [
+            list(jointly_contiguous_chunks(local_view, remote_view))
+            for local_view in local_views
+        ]
+        num_chunks = len(chunks_per_subblock[0])
+        assert all(len(chunks) == num_chunks for chunks in chunks_per_subblock)
 
         local_parts: list[np.ndarray] = []
         remote_parts: list[np.ndarray] = []
-        for local_offset, remote_offset, length in jointly_contiguous_chunks(
-            local_view, remote_view
-        ):
+        for chunk_idx in range(num_chunks):
+            chunk_group = [chunks[chunk_idx] for chunks in chunks_per_subblock]
+            remote_offset = chunk_group[0][1]
+            length = chunk_group[0][2]
+            assert all(
+                chunk[1] == remote_offset and chunk[2] == length
+                for chunk in chunk_group
+            )
+            subblock_offsets = np.asarray(
+                [chunk[0] for chunk in chunk_group], dtype=np.uint64
+            )
+            local_addrs = (
+                local_base_addr
+                + local_block_offsets[:, None]
+                + subblock_offsets[None, :]
+            ).flatten()
             local_parts.append(
-                NixlBaseConnectorWorker._stack_descs(
-                    local_base_addr + local_offset + local_block_offsets,
+                _stack_nixl_descriptors(
+                    local_addrs,
                     length,
                     local_device_id,
                 )
             )
             remote_parts.append(
-                NixlBaseConnectorWorker._stack_descs(
+                _stack_nixl_descriptors(
                     remote_base_addr + remote_offset + remote_block_offsets,
                     length,
                     remote_device_id,
@@ -264,12 +313,12 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             )
         return np.concatenate(local_parts), np.concatenate(remote_parts)
 
-    def _local_region_meta(
+    def _local_region_metas(
         self,
         spec: KVCacheSpec,
         region_idx: int,
         block_size_ratio: int,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         if isinstance(spec, MambaSpec):
             assert block_size_ratio == 1
             num_blocks = self._logical_num_blocks
@@ -279,9 +328,9 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             )
             content = sum(self._mamba_ssm_size)
         elif isinstance(spec, AttentionSpec):
-            num_blocks = self.num_blocks * block_size_ratio
-            stride = self.block_stride_per_layer[region_idx] // block_size_ratio
-            content = self.block_len_per_layer[region_idx] // block_size_ratio
+            num_blocks = self.num_blocks
+            stride = self.block_stride_per_layer[region_idx]
+            content = self.block_len_per_layer[region_idx]
         else:
             raise ValueError(f"Unsupported KV cache spec: {type(spec).__name__}")
         kv_cache_layout = (
@@ -289,14 +338,33 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             if self.use_host_buffer
             else self.kv_cache_layout
         )
-        return build_region_meta(
+        layers_per_region = (
+            len(self.kv_cache_config.kv_cache_tensors)
+            if self.transfer_topo is not None and self.transfer_topo.cross_layers_blocks
+            else 1
+        )
+        meta = build_region_meta(
             spec,
             num_blocks,
             self.block_size,
             stride,
             content,
             kv_cache_layout,
+            layers_per_region,
         )
+        if block_size_ratio == 1:
+            return [meta]
+
+        transfer_block_size = self.block_size // block_size_ratio
+        token_dim = meta.ndim - 2
+        return [
+            meta.narrow(
+                token_dim,
+                subblock_idx * transfer_block_size,
+                transfer_block_size,
+            )
+            for subblock_idx in range(block_size_ratio)
+        ]
 
     def _remote_region_meta(
         self,
@@ -315,6 +383,11 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             content = metadata.block_lens[region_idx]
         else:
             raise ValueError(f"Unsupported KV cache spec: {type(spec).__name__}")
+        layers_per_region = (
+            len(self.kv_cache_config.kv_cache_tensors)
+            if self.transfer_topo is not None and self.transfer_topo.cross_layers_blocks
+            else 1
+        )
         return build_region_meta(
             spec,
             num_blocks,
@@ -322,7 +395,50 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             stride,
             content,
             metadata.kv_cache_layout,
+            layers_per_region,
         )
+
+    def _build_packed_descriptor_pair(
+        self,
+        metadata: NixlAgentMetadata,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert self.world_size == remote_tp_size or self.use_mla, (
+            "Heterogeneous TP for non-replicated packed KV requires semantic "
+            "per-layer metadata"
+        )
+        assert len(self.block_len_per_layer) == 1
+        assert len(metadata.block_lens) == 1
+        local_content = self.block_len_per_layer[0]
+        remote_content = metadata.block_lens[0]
+        assert local_content == remote_content
+
+        local_meta = torch.as_strided(
+            torch.empty(1, dtype=torch.uint8, device="meta"),
+            size=(self.num_blocks, 1, 1, local_content),
+            stride=(self.block_stride_per_layer[0], local_content, local_content, 1),
+        )
+        remote_meta = torch.as_strided(
+            torch.empty(1, dtype=torch.uint8, device="meta"),
+            size=(metadata.num_blocks, 1, 1, remote_content),
+            stride=(metadata.block_strides[0], remote_content, remote_content, 1),
+        )
+        local_descs, remote_descs = self._views_to_nixl_descriptors(
+            local_meta,
+            remote_meta,
+            self.kv_caches_base_addr[self.engine_id][self.tp_rank][0],
+            metadata.kv_caches_base_addr[0],
+            self.device_id,
+            metadata.device_id,
+        )
+        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        local_descs = np.concatenate([local_descs] * num_groups)
+        remote_descs = np.concatenate([remote_descs] * num_groups)
+        self.xfer_descs_per_block_by_remote[metadata.engine_id][remote_tp_rank] = tuple(
+            1 for _ in range(num_groups)
+        )
+        return local_descs, remote_descs
 
     def _build_descriptor_pair(
         self,
@@ -343,39 +459,56 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         for spec in self._group_specs():
             group_descs_per_block = 0
             for region_idx, local_base in enumerate(local_bases):
-                local_meta = self._local_region_meta(spec, region_idx, block_size_ratio)
+                local_metas = self._local_region_metas(
+                    spec, region_idx, block_size_ratio
+                )
                 remote_meta = self._remote_region_meta(
                     spec,
                     region_idx,
                     metadata,
                     physical_blocks_per_logical,
                 )
-                local_slices = spec.slice_for_tp_transfer(
-                    local_meta,
-                    *remote_size_and_rank,
-                    *local_size_and_rank,
-                    self.model_config,
-                )
+                local_slices_per_subblock = [
+                    spec.slice_for_tp_transfer(
+                        local_meta,
+                        *remote_size_and_rank,
+                        *local_size_and_rank,
+                        self.model_config,
+                    )
+                    for local_meta in local_metas
+                ]
                 remote_slices = spec.slice_for_tp_transfer(
                     remote_meta,
                     *local_size_and_rank,
                     *remote_size_and_rank,
                     self.model_config,
                 )
-                assert len(local_slices) == len(remote_slices)
+                assert all(
+                    len(local_slices) == len(remote_slices)
+                    for local_slices in local_slices_per_subblock
+                )
 
-                for local_slice, remote_slice in zip(local_slices, remote_slices):
-                    local_descs, remote_descs = self._views_to_nixl_descriptors(
-                        local_slice,
+                for slice_idx, remote_slice in enumerate(remote_slices):
+                    local_slices = [
+                        slices[slice_idx] for slices in local_slices_per_subblock
+                    ]
+                    local_descs, remote_descs = self._mapped_views_to_nixl_descriptors(
+                        local_slices,
                         remote_slice,
                         local_base,
                         metadata.kv_caches_base_addr[region_idx],
                         self.device_id,
                         metadata.device_id,
                     )
-                    assert len(local_descs) == len(remote_descs)
-                    assert np.array_equal(local_descs[:, 1], remote_descs[:, 1])
-                    group_descs_per_block += len(local_descs) // len(local_slice)
+                    local_num_blocks = len(local_slices[0]) * len(local_slices)
+                    local_descs_per_block = len(local_descs) // local_num_blocks
+                    remote_descs_per_block = len(remote_descs) // len(remote_slice)
+                    assert local_descs_per_block == remote_descs_per_block
+                    assert np.array_equal(
+                        local_descs[::local_num_blocks, 1],
+                        remote_descs[:: len(remote_slice), 1],
+                    )
+                    group_descs_per_block += local_descs_per_block
                     local_parts.append(local_descs)
                     remote_parts.append(remote_descs)
             descs_per_block_per_group.append(group_descs_per_block)
@@ -385,43 +518,6 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             descriptor_layout
         )
         return np.concatenate(local_parts), np.concatenate(remote_parts)
-
-    def register_local_xfer_handler(
-        self,
-        block_size: int,
-    ) -> tuple[int, np.ndarray]:
-        if self._is_packed_kv:
-            return super().register_local_xfer_handler(block_size)
-
-        block_size_ratio = self.block_size // block_size
-        parts: list[np.ndarray] = []
-        descs_per_block_per_group: list[int] = []
-        local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-        for spec in self._group_specs():
-            group_descs_per_block = 0
-            for region_idx, base_addr in enumerate(local_bases):
-                meta = self._local_region_meta(spec, region_idx, block_size_ratio)
-                slices = spec.slice_for_tp_transfer(
-                    meta,
-                    self.world_size,
-                    self.tp_rank,
-                    self.world_size,
-                    self.tp_rank,
-                    self.model_config,
-                )
-                for view in slices:
-                    view_descs = self._view_to_nixl_descriptors(
-                        view, base_addr, self.device_id
-                    )
-                    group_descs_per_block += len(view_descs) // len(view)
-                    parts.append(view_descs)
-            descs_per_block_per_group.append(group_descs_per_block)
-
-        self._descs_per_block_per_group = tuple(descs_per_block_per_group)
-        blocks_data = np.concatenate(parts)
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-        handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-        return handle, blocks_data
 
     def _build_xfer_descs(
         self,
@@ -434,21 +530,15 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         remote_tp_rank: int,
         remote_tp_size: int,
     ) -> tuple[np.ndarray | None, np.ndarray]:
-        if (
-            self._is_packed_kv
-            or block_size_ratio != 1
-            or not self._can_build_descriptor_pairs()
-        ):
-            return super()._build_xfer_descs(
-                nixl_agent_meta,
-                plan,
-                block_size_ratio,
-                tp_ratio,
-                transfer_info,
-                physical_blocks_per_logical,
-                remote_tp_rank,
-                remote_tp_size,
+        if self._is_packed_kv:
+            assert block_size_ratio == 1, (
+                "Heterogeneous block sizes for packed KV require semantic "
+                "per-layer metadata"
             )
+            return self._build_packed_descriptor_pair(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
+        assert self._can_build_descriptor_pairs()
 
         return self._build_descriptor_pair(
             nixl_agent_meta,
@@ -457,17 +547,3 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             remote_tp_size,
             remote_tp_rank,
         )
-
-    def _build_local_splits_from_plan(
-        self,
-        plan: TPMapping,
-        src_blocks_data: np.ndarray,
-        num_fa_descs: int | None = None,
-    ) -> Iterator[list[tuple[int, int, int]]]:
-        if self._is_packed_kv or not self._can_build_descriptor_pairs():
-            yield from super()._build_local_splits_from_plan(
-                plan,
-                src_blocks_data,
-                num_fa_descs if num_fa_descs is not None else 0,
-            )
-        # Non-packed local slices are built directly with their remote peers.

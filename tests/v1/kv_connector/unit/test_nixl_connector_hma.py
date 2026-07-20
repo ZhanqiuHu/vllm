@@ -633,20 +633,10 @@ def _make_mock_worker_for_desc_ids(
     worker._has_mamba = has_mamba
     worker._group_spec_types = group_spec_types
     worker.block_len_per_layer = block_len_per_layer or [100]
-    worker._conv_decomp = None
-    if has_mamba:
-        from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (  # noqa: E501
-            MambaConvSplitInfo,
-        )
-
-        # Mamba2/GDN layout: 3 conv sub-projections -> 4 NIXL regions per layer.
-        worker._conv_decomp = MambaConvSplitInfo(
-            conv_rows=3,
-            local_proj_dims=(1, 1, 1),
-            conv_dtype_size=2,
-            ssm_sizes=(0, 0),
-        )
     worker._compute_desc_ids = NixlConnectorWorker._compute_desc_ids.__get__(
+        worker, NixlConnectorWorker
+    )
+    worker._group_num_blocks = NixlConnectorWorker._group_num_blocks.__get__(
         worker, NixlConnectorWorker
     )
     return worker
@@ -672,6 +662,7 @@ def test_get_block_descs_ids_hybrid_ssm():
         dst_num_blocks=100,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
+        descs_per_block_per_group=(2, 4),
     )
 
     expected = [3, 5, 103, 105, 201, 202, 301, 302, 401, 402, 501, 502]
@@ -702,6 +693,7 @@ def test_get_block_descs_ids_kernel_block_mismatch():
         dst_num_blocks=num_blocks,
         block_size_ratio=None,
         physical_blocks_per_logical=ratio,
+        descs_per_block_per_group=(2, 4),
     )
 
     expected = [3, 7, 403, 407, 801, 802, 901, 902, 1001, 1002, 1101, 1102]

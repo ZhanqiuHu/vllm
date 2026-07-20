@@ -10,7 +10,6 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,9 +24,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     TransferTopology,
     get_current_attn_backends,
-    kv_postprocess_blksize_and_layout_on_receive,
-    kv_postprocess_blksize_on_receive,
-    kv_postprocess_layout_on_receive,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -46,7 +42,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
     TPMapping,
-    _is_attention_spec,
     _is_ssm_spec,
     compute_tp_mapping,
 )
@@ -54,10 +49,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
     get_representative_spec_type,
     zmq_ctx,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
-    MambaConvSplitInfo,
-    derive_mamba_conv_split,
 )
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
@@ -96,67 +87,7 @@ class NixlBaseConnectorWorker:
         physical_blocks_per_logical: int,
         descs_per_block_per_group: tuple[int, ...] | None = None,
     ) -> np.ndarray:
-        """Compute NIXL descriptor IDs for given block IDs."""
-        num_fa_regions = self.num_regions
-        num_ssm_regions = 0
-        if self._has_mamba:
-            assert self._conv_decomp is not None
-            # NIXL regions per SSM layer = conv sub-projections + 1 SSM temporal
-            # (Mamba2/GDN: 3+1=4; Mamba1: 1+1=2).
-            ssm_regions_per_layer = len(self._conv_decomp.local_conv_offsets) + 1
-            num_ssm_regions = len(self.block_len_per_layer) * ssm_regions_per_layer
-
-        num_blocks = dst_num_blocks
-        if block_size_ratio is not None:
-            num_blocks = int(num_blocks * block_size_ratio)
-        num_fa_descs = num_fa_regions * num_blocks
-
-        # All-attention fast path: single vectorized broadcast.
-        if num_ssm_regions == 0:
-            # NOTE (NickLucche) With HMA, every kv group has the same number of layers
-            # and layers from different groups share the same kv tensor.
-            # eg block_ids=[[1, 2], [3]]->blocks [1, 2] need to be
-            # read across all regions, same for [3], but group0-group1 blocks will
-            # always differ (different areas). Therefore we can just flatten the
-            # block_ids and compute the descs ids for all groups at once.
-            block_arr = np.concatenate(block_ids)[None, :]
-            region_ids = np.arange(num_fa_regions)[:, None]
-            return (region_ids * num_blocks + block_arr).flatten()
-
-        # Compute desc ids per group using the right stride: FA descs have
-        # num_blocks entries per region (kernel granularity), SSM descs have
-        # logical_blocks entries per region (no kernel splitting).
-        logical_blocks = num_blocks // physical_blocks_per_logical
-        all_descs: list[np.ndarray] = []
-        for i, group in enumerate(block_ids):
-            group_arr = np.asarray(group)
-            if _is_attention_spec(self._group_spec_types[i]):
-                fa_region_ids = np.arange(num_fa_regions)[:, None]
-                all_descs.append(
-                    (fa_region_ids * num_blocks + group_arr[None, :]).flatten()
-                )
-            elif _is_ssm_spec(self._group_spec_types[i]):
-                # NOTE (NickLucche) SSM and Attention block regions can
-                # be exchanged arbitrarily by manager.  Therefore, descs
-                # are laid out as:
-                #   [descs_fa (all regions) | descs_ssm (all regions)].
-                # num_fa_descs offset must be computed per-engine since
-                # P and D can have different num_blocks (and thus
-                # different FA desc counts).
-                ssm_region_ids = np.arange(num_ssm_regions)[:, None]
-                all_descs.append(
-                    (
-                        ssm_region_ids * logical_blocks
-                        + group_arr[None, :]
-                        + num_fa_descs
-                    ).flatten()
-                )
-            else:
-                raise ValueError(
-                    f"Unknown spec type {self._group_spec_types[i]} at index {i}"
-                )
-
-        return np.concatenate(all_descs)
+        raise NotImplementedError
 
     def _get_xfer_descs_per_block(
         self, engine_id: EngineId, remote_tp_rank: int
@@ -164,75 +95,6 @@ class NixlBaseConnectorWorker:
         return self.xfer_descs_per_block_by_remote.get(engine_id, {}).get(
             remote_tp_rank
         )
-
-    def _build_local_splits_from_plan(
-        self,
-        plan: TPMapping,
-        src_blocks_data: np.ndarray,
-        num_fa_descs: int,
-    ) -> Iterator[list[tuple[int, int, int]]]:
-        """Build split handle data for P_TP > D_TP scenario.
-
-        num_fa_descs is the boundary between FA and SSM descriptors.
-        Split counts are derived from source_ranks_per_group lengths.
-        FA uses rank_to_attention_slot for the slot offset;
-        SSM uses the rank's positional index.
-        """
-        fa_idx = next(
-            i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
-        )
-        fa_num_splits = len(plan.source_ranks_per_group[fa_idx])
-
-        has_ssm_descs = num_fa_descs < len(src_blocks_data)
-        ssm_idx = next(
-            (i for i, t in enumerate(self._group_spec_types) if _is_ssm_spec(t)),
-            None,
-        )
-        ssm_num_splits = (
-            len(plan.source_ranks_per_group[ssm_idx])
-            if has_ssm_descs and ssm_idx is not None
-            else 0
-        )
-
-        # Per-FA-descriptor replicate flag, in _build_fa_local emission order.
-        fa_desc_replicated = self._fa_desc_replicated(num_fa_descs)
-        src_blocks_list = src_blocks_data.tolist()
-
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
-            fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
-
-            handle: list[tuple[int, int, int]] = []
-            for j, (addr, local_len, dev) in enumerate(src_blocks_list):
-                if j < num_fa_descs:
-                    if fa_desc_replicated[j]:
-                        # REPLICATE (MLA): whole block written on every rank.
-                        handle.append((addr, local_len, dev))
-                    else:
-                        # SPLIT (full-attn): this rank's head slice.
-                        chunk = local_len // fa_num_splits
-                        handle.append((addr + fa_slot * chunk, chunk, dev))
-                else:
-                    chunk = local_len // ssm_num_splits
-                    handle.append((addr + p_idx * chunk, chunk, dev))
-            yield handle
-
-    def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
-        """Per-FA-descriptor replicate flag, in _build_fa_local emission order
-        (region-major; K then optional V per region). Length ``num_fa_descs``.
-        """
-        assert self.transfer_topo is not None
-        n_regions = len(self.block_len_per_layer)
-        if n_regions == 0 or self.num_regions == 0:
-            return [False] * num_fa_descs
-        nblk = num_fa_descs // self.num_regions
-        flags: list[bool] = []
-        for i in range(n_regions):
-            replicated = self._is_region_replicated(i)
-            flags.extend([replicated] * nblk)
-        assert len(flags) == num_fa_descs, (
-            f"FA desc flags {len(flags)} != num_fa_descs {num_fa_descs}"
-        )
-        return flags
 
     def _is_region_replicated(self, region_idx: int) -> bool:
         """Whether region ``region_idx`` is transferred REPLICATE vs SPLIT.
@@ -298,10 +160,6 @@ class NixlBaseConnectorWorker:
 
         # ---- Model state (derived from model config) ----
         mamba_ssm_size = (0, 0)
-        # Conv state sub-projection decomposition (None when no Mamba).
-        # The transfer requires DS (dim, state_len) conv layout so that
-        # conv sub-projections are contiguous in memory.
-        self._conv_decomp: MambaConvSplitInfo | None = None
         self._has_mamba = any(
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
@@ -321,11 +179,10 @@ class NixlBaseConnectorWorker:
                 for spec in self._layer_specs.values()
                 if isinstance(spec, MambaSpec)
             )
-            self._conv_decomp = derive_mamba_conv_split(
-                mamba_spec,
-                vllm_config.parallel_config.tensor_parallel_size,
+            mamba_ssm_size = (
+                mamba_spec.conv_state_bytes,
+                mamba_spec.content_bytes - mamba_spec.conv_state_bytes,
             )
-            mamba_ssm_size = self._conv_decomp.ssm_sizes
         self._mamba_ssm_size = mamba_ssm_size
 
         # Agent.
@@ -364,7 +221,6 @@ class NixlBaseConnectorWorker:
         self.world_size = get_tensor_model_parallel_world_size()
 
         self.num_blocks = kv_cache_config.num_blocks
-        self.enable_permute_local_kv = False
         self.enable_heterogeneous_attn_post_process = False
 
         # KV Caches and nixl tracking data.
@@ -449,11 +305,6 @@ class NixlBaseConnectorWorker:
         # Keep heartbeat handshakes to a PP-sharded producer notif-only.
         self._hb_handshake_notif_only = False
 
-        # nixl_prepped_dlist_handle.
-        self.src_xfer_handles_by_block_size: dict[int, int] = {}
-        # Populated dynamically during handshake based on remote configuration.
-        # Keep track of regions at different tp_ratio values. tp_ratio->handles
-        self.src_xfer_handles_by_tp_ratio: dict[int, list[int]] = {}
         self.src_xfer_handles_by_remote = defaultdict[EngineId, dict[int, int]](dict)
         self.xfer_descs_per_block_by_remote = defaultdict[
             EngineId, dict[int, tuple[int, ...]]
@@ -764,21 +615,11 @@ class NixlBaseConnectorWorker:
                     assert kv_cache.ndim == 4
 
                     if self.kv_cache_layout == "NHD":
-                        if self.kv_transfer_config.enable_permute_local_kv:
-                            logger.info_once(
-                                "'enable_permute_local_kv' flag is enabled while "
-                                "device KV Layout is NHD. Init host buffer with"
-                                " HND to better support Decode/Prefill TP_ratio > 1."
-                            )
-                            # Since NHD will not support Decode/Prefill TP_ratio > 1,
-                            # we can leverage host_buffer for permute.
-                            self.host_buffer_kv_cache_layout = "HND"
-                        else:
-                            # Packed KV layout is logical (B, H, N, 2*D). Allocate
-                            # (B, N, H, 2*D) and view it as logical (B, H, N, 2*D)
-                            # so raw NIXL transfers see NHD physical strides.
-                            kv_shape = tuple(kv_shape[i] for i in inv_order)
-                            permute_shape = True
+                        # Packed KV layout is logical (B, H, N, 2*D). Allocate
+                        # (B, N, H, 2*D) and view it as logical (B, H, N, 2*D)
+                        # so NIXL descriptors retain the device's physical strides.
+                        kv_shape = tuple(kv_shape[i] for i in inv_order)
+                        permute_shape = True
 
                 xfer_buffers[layer_name] = torch.empty(
                     kv_shape, dtype=kv_dtype, device="cpu"
@@ -1014,10 +855,6 @@ class NixlBaseConnectorWorker:
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
-        self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
-            self.register_local_xfer_handler(self.block_size)
-        )
-
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1042,12 +879,6 @@ class NixlBaseConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
-
-    def _on_kv_caches_registered(self) -> None:
-        """Hook called after NIXL memory regions are registered but before
-        local descriptors are built.  No-op in the base class; multiview
-        overrides this to build DescriptorViews."""
-        pass
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
@@ -1121,8 +952,7 @@ class NixlBaseConnectorWorker:
         tensor_size_bytes = None
 
         for layer_name, cache_or_caches in xfer_buffers.items():
-            # NOTE (NickLucche) Hybrid SSM models assume a layout that is similar to
-            # that of FI, with block laid out as in `get_backend_aware_kv_block_len`.
+            # NOTE (NickLucche) Hybrid SSM models assume a layout similar to FI.
             # However, physical page_size may differ when kernel requires a specific
             # block size. This leads to SSM and FA layers having different num_blocks.
             # `_physical_blocks_per_logical_kv_block` ratio is used to adjust for this.
@@ -1263,8 +1093,6 @@ class NixlBaseConnectorWorker:
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
-        self._on_kv_caches_registered()
-
         if self._has_mamba:
             logger.info(
                 "Hybrid SSM registration: num_blocks=%s, "
@@ -1278,11 +1106,6 @@ class NixlBaseConnectorWorker:
                 self._mamba_ssm_size,
                 set(self.block_len_per_layer),
             )
-
-        # Register local/src descr for NIXL xfer.
-        self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
-            self.register_local_xfer_handler(self.block_size)
-        )
 
         # After KV Caches registered, listen for new connections.
         agent_metadata = NixlAgentMetadata(
@@ -1310,222 +1133,6 @@ class NixlBaseConnectorWorker:
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
-
-    def _build_mamba_local(
-        self,
-        base_addresses: list[int],
-        block_size_ratio: int,
-    ) -> np.ndarray:
-        """Build desc regions (conv sub-projections + ssm) per layer for
-        local mamba blocks with DS conv layout, as an Nx3 uint64 array."""
-        assert block_size_ratio == 1, (
-            "Mamba 3-read transfer with block_size_ratio != 1 is not tested. "
-            f"Got block_size_ratio={block_size_ratio}."
-        )
-        assert base_addresses, "Local KV cache base addresses must not be empty."
-        assert self._conv_decomp is not None
-        conv_offsets = self._conv_decomp.local_conv_offsets
-        conv_size, ssm_size = self._mamba_ssm_size
-        num_blocks = self._logical_num_blocks * block_size_ratio
-        physical_per_logical = self._physical_blocks_per_logical_kv_block
-        device_id = self.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
-
-        parts: list[np.ndarray] = []
-        for i, base_addr in enumerate(base_addresses):
-            # Jump one page_size, but ssm page_size may be bigger when kernel
-            # locks block size to a specific value (physical_per_logical scale).
-            page_stride = (
-                self.block_len_per_layer[i] // block_size_ratio * physical_per_logical
-            )
-            blk_addrs = base_addr + block_arange * page_stride
-            for off, sz in conv_offsets:
-                parts.append(self._stack_descs(blk_addrs + off, sz, device_id))
-            # SSM temporal state follows the conv state.
-            parts.append(self._stack_descs(blk_addrs + conv_size, ssm_size, device_id))
-        return np.concatenate(parts)
-
-    def _build_mamba_remote(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        tp_ratio: int,
-        transfer_info: EngineTransferInfo,
-    ) -> np.ndarray:
-        """Build remote desc regions (conv sub-projections + ssm) per layer.
-        For hetero-TP, each D rank reads only its sub-projection slice from
-        the P rank. Returns an Nx3 uint64 array."""
-        assert nixl_agent_meta.kv_caches_base_addr, (
-            "Remote KV cache base addresses must not be empty."
-        )
-        assert self._conv_decomp is not None
-        effective_ratio = max(tp_ratio, 1)
-        # Mamba conv state is always TP-sharded, even when attention KV
-        # is replicated (num_kv_heads < tp_size).
-        local_offset = self.tp_rank % effective_ratio
-        conv_size_remote = nixl_agent_meta.ssm_sizes[0]
-
-        conv_offsets = self._conv_decomp.remote_conv_offsets(local_offset, tp_ratio)
-        if tp_ratio >= 1:
-            ssm_read_size = self._mamba_ssm_size[1]
-        else:
-            ssm_read_size = nixl_agent_meta.ssm_sizes[1]
-
-        remote_physical_per_logical = transfer_info.remote_physical_blocks_per_logical
-        num_blocks = nixl_agent_meta.num_blocks // remote_physical_per_logical
-        device_id = nixl_agent_meta.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
-
-        parts: list[np.ndarray] = []
-        # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
-        # block lengths vary across layers (e.g. MLA).
-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
-            page_stride = nixl_agent_meta.block_lens[i] * remote_physical_per_logical
-            blk_addrs = base_addr + block_arange * page_stride
-            for off, sz in conv_offsets:
-                parts.append(self._stack_descs(blk_addrs + off, sz, device_id))
-            # SSM temporal state is also TP-sharded on the heads dimension.
-            ssm_addrs = blk_addrs + conv_size_remote + local_offset * ssm_read_size
-            parts.append(self._stack_descs(ssm_addrs, ssm_read_size, device_id))
-        return np.concatenate(parts)
-
-    @staticmethod
-    def _stack_descs(addrs: np.ndarray, length: int, device_id: int) -> np.ndarray:
-        out = np.empty((addrs.shape[0], 3), dtype=np.uint64)
-        out[:, 0] = addrs
-        out[:, 1] = length
-        out[:, 2] = device_id
-        return out
-
-    def _build_fa_local(
-        self,
-        base_addresses: list[int],
-        block_size_ratio: int,
-    ) -> np.ndarray:
-        """Build local FA descriptors for all layers as an Nx3 uint64 array."""
-        assert self.transfer_topo is not None
-        assert base_addresses, "Local KV cache base addresses must not be empty."
-        num_blocks = self.num_blocks * block_size_ratio
-        device_id = self.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
-        parts: list[np.ndarray] = []
-        for i, base_addr in enumerate(base_addresses):
-            kv_block_len = (
-                self.get_backend_aware_kv_block_len(
-                    layer_idx=i, first_split=True, mamba_view=False
-                )
-                // block_size_ratio
-            )
-            page_stride = self.block_len_per_layer[i] // block_size_ratio
-            addrs = base_addr + block_arange * page_stride
-            parts.append(self._stack_descs(addrs, kv_block_len, device_id))
-        return np.concatenate(parts)
-
-    def _build_fa_remote(
-        self,
-        plan: TPMapping,
-        nixl_agent_meta: NixlAgentMetadata,
-        block_size_ratio: int,
-    ) -> np.ndarray:
-        """Build remote FA descriptors for all layers as an Nx3 uint64 array."""
-        assert self.transfer_topo is not None
-        assert nixl_agent_meta.kv_caches_base_addr, (
-            "Remote KV cache base addresses must not be empty."
-        )
-        fa_group_idx = next(
-            i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
-        )
-        # SPLIT regions read their head slice from this many remote ranks at a
-        # per-rank offset; REPLICATE regions read the whole block once.
-        split_reads = len(plan.source_ranks_per_group[fa_group_idx])
-        num_blocks = nixl_agent_meta.num_blocks
-        device_id = nixl_agent_meta.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
-        parts: list[np.ndarray] = []
-        for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
-            replicated = self._is_region_replicated(i)
-            # Read our whole local region size from remote..
-            local_block_len = self.get_backend_aware_kv_block_len(
-                layer_idx=i, first_split=True, mamba_view=False
-            )
-            remote_kv_block_len = local_block_len // block_size_ratio
-            if block_size_ratio > 1:
-                # ..using remote kv_block_len as transfer unit
-                local_block_len = remote_kv_block_len
-
-            # REPLICATE reads the whole block once at offset 0; SPLIT gathers
-            # its head slice from `split_reads` remote ranks at a per-rank offset.
-            num_reads = 1 if replicated else split_reads
-            rank_offset = (
-                0 if replicated else plan.rank_offset_factor * remote_kv_block_len
-            )
-            local_block_len = local_block_len // num_reads
-
-            page_size = nixl_agent_meta.block_lens[i]
-            addrs = base_addr + rank_offset + block_arange * page_size
-            parts.append(self._stack_descs(addrs, local_block_len, device_id))
-        return np.concatenate(parts)
-
-    def register_local_xfer_handler(
-        self,
-        block_size: int,
-    ) -> tuple[int, np.ndarray]:
-        """
-        Function used for register local xfer handler with local block_size or
-        Remote block_size.
-
-        When local block_size is same as remote block_size, we use local block_size
-        to register local_xfer_handler during init.
-
-        When remote block size is less than local block size, we need to use
-        register another local_xfer_handler using remote block len to ensure
-        data copy correctness.
-        """
-        assert self.transfer_topo is not None
-        block_size_ratio = self.block_size // block_size
-        local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-
-        blocks_data = self._build_fa_local(local_base_addresses, block_size_ratio)
-        logger.debug(
-            "Created %s blocks for src engine %s and rank %s on device id %s",
-            len(blocks_data),
-            self.engine_id,
-            self.tp_rank,
-            self.device_id,
-        )
-        if self._has_mamba:
-            assert self.num_descs == len(blocks_data)
-            # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
-            # is unnecessary — a single conv desc per block suffices.  Consider
-            # adding a fast path that falls back to the standard 2-region
-            # registration (_build_fa_local mamba=True) when no hetero-TP
-            # remote has been seen.  Currently we always register 4 regions
-            # because local descs are created before knowing the remote TP.
-            logger.debug("Registering local Mamba descriptors (4 regions/layer)")
-            mamba = self._build_mamba_local(local_base_addresses, block_size_ratio)
-            blocks_data = np.concatenate([blocks_data, mamba])
-
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-        # NIXL_INIT_AGENT to be used for preparations of local descs.
-        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
-
-    def _get_local_xfer_side_handle(
-        self,
-        engine_id: str,
-        remote_tp_rank: int,
-        remote_block_size: int,
-        tp_ratio: int,
-        source_index: int,
-    ) -> int:
-        """Return the local descriptor handle paired with a remote rank."""
-        paired_handle = self.src_xfer_handles_by_remote.get(engine_id, {}).get(
-            remote_tp_rank
-        )
-        if paired_handle is not None:
-            return paired_handle
-        if tp_ratio < 0 and not self.use_mla:
-            assert remote_block_size == self.block_size
-            return self.src_xfer_handles_by_tp_ratio[tp_ratio][source_index]
-        return self.src_xfer_handles_by_block_size[remote_block_size]
 
     def add_remote_agent(
         self,
@@ -1661,28 +1268,6 @@ class NixlBaseConnectorWorker:
 
         plan = self.tp_mappings[engine_id]
 
-        ### (Optional) Register local agent memory regions. MLA is not split.
-        if (
-            tp_ratio < 0
-            and not self.use_mla
-            and tp_ratio not in self.src_xfer_handles_by_tp_ratio
-        ):
-            # Remote tp_size > local tp_size: read from multiple remote ranks.
-            # Logically "split" own regions into |tp_ratio| chunks. Mind that
-            # we only do this once per remote tp_size (replica-friendly).
-            self.src_xfer_handles_by_tp_ratio[tp_ratio] = []
-
-            for handle_data in self._build_local_splits_from_plan(
-                plan,
-                self.src_blocks_data,
-                self.num_descs,
-            ):
-                descs = self.nixl_wrapper.get_xfer_descs(
-                    handle_data, self.nixl_memory_type
-                )
-                handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
-                self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
-
         ### Register remote agent memory regions
         local_blocks_data, remote_blocks_data = self._build_xfer_descs(
             nixl_agent_meta,
@@ -1712,13 +1297,6 @@ class NixlBaseConnectorWorker:
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
 
-        if block_size_ratio > 1:
-            # when prefill with smaller block_size, we need to init a
-            # new handler with same block_len to match
-            self.src_xfer_handles_by_block_size[nixl_agent_meta.block_size] = (
-                self.register_local_xfer_handler(nixl_agent_meta.block_size)[0]
-            )
-
         return remote_agent_name
 
     def _build_xfer_descs(
@@ -1732,49 +1310,7 @@ class NixlBaseConnectorWorker:
         remote_tp_rank: int,
         remote_tp_size: int,
     ) -> tuple[np.ndarray | None, np.ndarray]:
-        """Build optional paired local descriptors and remote descriptors."""
-        return (
-            None,
-            self._build_all_remote_descs(
-                nixl_agent_meta,
-                plan,
-                block_size_ratio,
-                tp_ratio,
-                transfer_info,
-                physical_blocks_per_logical,
-                remote_tp_rank,
-                remote_tp_size,
-            ),
-        )
-
-    def _build_all_remote_descs(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        plan: TPMapping,
-        block_size_ratio: int,
-        tp_ratio: int,
-        transfer_info: EngineTransferInfo,
-        physical_blocks_per_logical: int,
-        remote_tp_rank: int,
-        remote_tp_size: int,
-    ) -> np.ndarray:
-        """Build remote descriptors for one remote rank.
-
-        Override in subclass for view-based descriptor building.
-        """
-        blocks_data = self._build_fa_remote(
-            plan,
-            nixl_agent_meta,
-            block_size_ratio,
-        )
-        if self._has_mamba:
-            mamba = self._build_mamba_remote(
-                nixl_agent_meta,
-                tp_ratio,
-                transfer_info,
-            )
-            blocks_data = np.concatenate([blocks_data, mamba])
-        return blocks_data
+        raise NotImplementedError
 
     def _validate_remote_agent_handshake(
         self, nixl_agent_meta: NixlAgentMetadata, remote_tp_size: int
@@ -1822,30 +1358,6 @@ class NixlBaseConnectorWorker:
             assert block_size_ratio == 1, (
                 "HMA does not support different remote block size yet"
             )
-        kv_cache_layout = (
-            self.kv_cache_layout
-            if not self.use_host_buffer
-            else self.host_buffer_kv_cache_layout
-        )
-        if not self.use_mla and nixl_agent_meta.kv_cache_layout != kv_cache_layout:
-            if (
-                self.kv_transfer_config.enable_permute_local_kv
-                and nixl_agent_meta.kv_cache_layout == "HND"
-            ):
-                logger.info(
-                    "Remote is HND and local is NHD, enabled additional permute "
-                    "on local device KV."
-                )
-                assert not self._is_hma_required, (
-                    "HMA does not support block size post processing"
-                )
-                self.enable_permute_local_kv = True
-            else:
-                raise RuntimeError(
-                    "Heterogeneous TP expects same kv_cache_layout. "
-                    "Or enable experimental feature to use HND to NHD support by "
-                    "setting 'enable_permute_local_kv'=True in --kv-transfer-config."
-                )
         # if remote_agent used attn is not same as local,
         # hint heterogenuous attn post process
         if (
@@ -1861,21 +1373,6 @@ class NixlBaseConnectorWorker:
                 "hint heterogeneous attn post process"
             )
             self.enable_heterogeneous_attn_post_process = True
-
-        # Heterogeneous TP requires head-splitting, which only works with
-        # HND layout. MLA and replicated-KV cases don't split on heads.
-        # Mamba doesn't support heterogeneous TP.
-        if (
-            abs(tp_ratio) != 1
-            and not self.use_mla
-            and not self.transfer_topo.is_kv_replicated(remote_engine_id)
-            and kv_cache_layout != "HND"
-            and not self.enable_permute_local_kv
-        ):
-            raise RuntimeError(
-                "Heterogeneous TP head-dimension splitting requires contiguous heads. "
-                "Use HND layout on the prefill side."
-            )
 
         # Per-region block_len validation enforcing the P/D invariant.
         # REPLICATE regions (MLA, or a whole-model MLA / replicated-KV transfer)
@@ -1977,58 +1474,6 @@ class NixlBaseConnectorWorker:
                     "d2h",
                 )
 
-    def post_process_device_kv_on_receive(
-        self,
-        block_size_ratio: int,
-        block_ids_list: list[list[int]],
-    ):
-        """
-        Post process device kv cache after receiving from remote.
-
-        3 types of post processing supported:
-            * kv_cache_postprocess_layout => convert from HND to NHD
-            * kv_cache_postprocess_blksize => convert from small block size
-              to large block size
-            * kv_cache_postprocess_blksize_and_layout => convert from small
-              block size to large block size and convert from HND to NHD
-
-        """
-        if len(self.device_kv_caches) == 0:
-            return
-        assert block_size_ratio >= 1, "Only nP < nD supported currently."
-        assert self.transfer_topo is not None
-        if self.enable_permute_local_kv and block_size_ratio > 1:
-            logger.debug(
-                "Post-processing device kv cache on receive by converting "
-                "block_size with %sx bigger and permuting layout from HND"
-                " to NHD.",
-                block_size_ratio,
-            )
-        elif self.enable_permute_local_kv:
-            logger.debug(
-                "Post-processing device kv cache on receive by permuting layout"
-                "from HND to NHD."
-            )
-        else:
-            logger.debug(
-                "Post-processing device kv cache on receive by converting "
-                "block_size with %sx bigger.",
-                block_size_ratio,
-            )
-
-        for block_ids in block_ids_list:
-            indices = torch.tensor(block_ids, device=self.device_type, dtype=torch.long)
-
-            for cache in self.device_kv_caches.values():
-                if self.enable_permute_local_kv and block_size_ratio > 1:
-                    kv_postprocess_blksize_and_layout_on_receive(
-                        cache, indices, block_size_ratio
-                    )
-                elif self.enable_permute_local_kv:
-                    kv_postprocess_layout_on_receive(cache, indices)
-                else:
-                    kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio)
-
     def post_process_device_kv_on_receive_heterogeneous_attn(
         self, block_ids: list[int]
     ):
@@ -2083,7 +1528,6 @@ class NixlBaseConnectorWorker:
                 len(failed_recv_reqs),
             )
 
-        block_ids_for_blocksize_post_process = defaultdict(list)
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
         for req_id in done_recving:
             # clean up metadata for completed requests
@@ -2102,29 +1546,11 @@ class NixlBaseConnectorWorker:
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
 
-            # post processing for heteroblocksize
-            remote_info = self.transfer_topo.get_engine_info(meta.remote.engine_id)
-            block_size_ratio = self.transfer_topo.block_size_ratio(
-                remote_info.remote_block_size
-            )
-            if not self.use_mla and (
-                block_size_ratio > 1 or self.enable_permute_local_kv
-            ):
-                assert not self._is_hma_required
-                block_ids_for_blocksize_post_process[block_size_ratio].append(
-                    meta.local_physical_block_ids[0]
-                )
             # post processing for heterogeneous attention
             if self.enable_heterogeneous_attn_post_process:
                 block_ids_for_heterogeneous_attn_post_process.append(
                     meta.local_physical_block_ids[0]
                 )
-        for (
-            block_size_ratio,
-            block_ids_list,
-        ) in block_ids_for_blocksize_post_process.items():
-            self.post_process_device_kv_on_receive(block_size_ratio, block_ids_list)
-
         for block_ids in block_ids_for_heterogeneous_attn_post_process:
             self.post_process_device_kv_on_receive_heterogeneous_attn(block_ids)
 
@@ -2420,46 +1846,6 @@ class NixlBaseConnectorWorker:
                     remote_block_ids[i] = remote_group[:num_blocks]
         return local_block_ids, remote_block_ids
 
-    def get_backend_aware_kv_block_len(
-        self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
-    ) -> int:
-        """
-        Get the block length for one K/V element (K and V have the same size).
-
-        For FA and other backends, this is equal to the length of the whole
-        block, as K and V are in separate regions.
-        For FlashInfer, this is half the length of the whole block, as K and V
-        share the same region.
-        Similarly, for SSM-based models, state and conv are interleaved, but crucially
-        the their size differs.
-        Reference diagram:
-                            KVCacheTensor (Shared)
-                               /       \\
-                              /         \\
-                             /           \\
-        Attention (FlashInfer) View      Mamba View
-                  |                          |
-                  |                          |
-           +-------------------+         +-------------------+
-           | KVCacheTensor     |         | KVCacheTensor      |
-           |                   |         |                    |
-           |<----- page ------>|         |<----- page ------->|
-           |       size        |         |       size         |
-           |  Key 0  |  Val 0  |         |Conv 0  |   SSM 0   |
-           |  Key 1  |  Val 1  |         |Conv 1  |   SSM 1   |
-           |   ...   |   ...   |         |  ...   |    ...    |
-           | Key N-2 | Val N-2 |         |Conv N-2|   SSM N-2 |
-           | Key N-1 | Val N-1 |         |Conv N-1|   SSM N-1 |
-           +-------------------+         +--------------------+
-           |1st_split-2nd_split|         |1st_split-2nd_split |
-        """
-        assert self.transfer_topo is not None
-        if self.transfer_topo.virtually_split_kv_in_blocks and mamba_view:
-            block_len = self._mamba_ssm_size[not first_split]
-        else:
-            block_len = self.block_len_per_layer[layer_idx]
-        return block_len
-
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """
         Get the KV transfer stats for the connector.
@@ -2562,13 +1948,6 @@ class NixlBaseConnectorWorker:
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
         self._recving_transfers.clear()
-        for handle in self.src_xfer_handles_by_block_size.values():
-            self.nixl_wrapper.release_dlist_handle(handle)
-        self.src_xfer_handles_by_block_size.clear()
-        for handles in self.src_xfer_handles_by_tp_ratio.values():
-            for handle in handles:
-                self.nixl_wrapper.release_dlist_handle(handle)
-        self.src_xfer_handles_by_tp_ratio.clear()
         for engine_id in list(self._remote_agents):
             self._cleanup_remote_engine(engine_id, log_eviction=False)
         for desc in self._registered_descs:
