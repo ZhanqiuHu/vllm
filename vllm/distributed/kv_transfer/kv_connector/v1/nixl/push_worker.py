@@ -557,13 +557,13 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_size,
                 req_id,
             )
-            if tp_ratio < 0 and not self.use_mla:
-                assert remote_block_size == self.block_size
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
-            else:
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+            local_xfer_side_handle = self._get_local_xfer_side_handle(
+                meta.remote.engine_id,
+                spec.remote_rank,
+                remote_block_size,
+                tp_ratio,
+                i,
+            )
 
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
                 spec.remote_rank
@@ -641,18 +641,24 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             elif num_local < num_remote:
                 remote_block_ids[i] = remote_block_ids[i][:num_local]
 
+        descs_per_block_per_group = self._get_xfer_descs_per_block(
+            dst_engine_id, remote_rank
+        )
+
         # Get descs ids.
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            descs_per_block_per_group=descs_per_block_per_group,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            descs_per_block_per_group=descs_per_block_per_group,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)

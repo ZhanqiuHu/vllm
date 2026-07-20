@@ -41,6 +41,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
     NixlHandshakePayload,
     NixlKVConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker_multiview import (
+    NixlBaseConnectorWorkerMultiview,
+    jointly_contiguous_chunks,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
 )
@@ -75,6 +79,61 @@ from .utils import (
     create_vllm_config,
     make_kv_cache_config,
 )
+
+
+def test_jointly_contiguous_chunks_coalesces_shared_layout():
+    view = torch.as_strided(
+        torch.empty(1, dtype=torch.uint8, device="meta"),
+        size=(2, 2, 3, 4),
+        stride=(24, 12, 4, 1),
+    )
+
+    assert list(jointly_contiguous_chunks(view, view)) == [(0, 0, 24)]
+
+
+def test_jointly_contiguous_chunks_splits_different_layouts():
+    local = torch.as_strided(
+        torch.empty(1, dtype=torch.uint8, device="meta"),
+        size=(2, 2, 3, 4),
+        stride=(24, 12, 4, 1),
+    )
+    remote = torch.as_strided(
+        torch.empty(1, dtype=torch.uint8, device="meta"),
+        size=(2, 2, 3, 4),
+        stride=(24, 4, 8, 1),
+    )
+
+    assert list(jointly_contiguous_chunks(local, remote)) == [
+        (0, 0, 4),
+        (4, 8, 4),
+        (8, 16, 4),
+        (12, 4, 4),
+        (16, 12, 4),
+        (20, 20, 4),
+    ]
+
+    local_descs, remote_descs = (
+        NixlBaseConnectorWorkerMultiview._views_to_nixl_descriptors(
+            local,
+            remote,
+            local_base_addr=100,
+            remote_base_addr=1000,
+            local_device_id=0,
+            remote_device_id=1,
+        )
+    )
+    assert local_descs[:4].tolist() == [
+        [100, 4, 0],
+        [124, 4, 0],
+        [104, 4, 0],
+        [128, 4, 0],
+    ]
+    assert remote_descs[:4].tolist() == [
+        [1000, 4, 1],
+        [1024, 4, 1],
+        [1008, 4, 1],
+        [1032, 4, 1],
+    ]
 
 
 @pytest.fixture(scope="module", autouse=True)

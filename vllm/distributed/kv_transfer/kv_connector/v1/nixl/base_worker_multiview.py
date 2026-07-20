@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Multi-view descriptor layer for the NIXL connector.
-
-Replaces the per-spec builder methods (_build_fa_local/remote,
-_build_mamba_local/remote) with a unified DescriptorView abstraction
-that delegates layout decisions to KVCacheSpec.compute_transfer_shape()
-and KVCacheSpec.slice_for_tp_transfer().
-
-Wire-in: change the import in pull_worker.py / push_worker.py to use
-NixlBaseConnectorWorkerMultiview as the base class.
-"""
+"""Paired local/remote descriptor construction for the NIXL connector."""
 
 from collections.abc import Iterator
-from dataclasses import dataclass
-from math import prod
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -44,13 +33,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
-# 4D dim index for the batch/block dimension.
 _DIM4_B = 0
-
-
-# ---------------------------------------------------------------------------
-# Core primitives
-# ---------------------------------------------------------------------------
 
 
 def build_region_meta(
@@ -59,94 +42,89 @@ def build_region_meta(
     block_size: int,
     block_stride_bytes: int,
     region_content_bytes: int,
+    kv_cache_layout: str = "HND",
 ) -> torch.Tensor:
-    """Build a ``(B, H, N, C)`` meta tensor for one KV cache region.
-
-    Shape is derived from ``spec.compute_transfer_shape()`` which knows the
-    logical layout (heads, tokens, head_dim) for each spec type.
-
-    ``slice_for_tp_transfer`` later narrows/splits this into descriptor streams.
-    ``_view_to_descriptors`` consumes only ``stride(0)``, ``shape``, and
-    ``storage_offset``.
-    """
+    """Build a ``(B, H, N, C)`` metadata tensor for a cache region."""
     dtype = getattr(spec, "dtype", torch.int8)
     elem = get_dtype_size(dtype)
-    H, N, C = spec.compute_transfer_shape(region_content_bytes, block_size)
-
-    meta = torch.as_strided(
+    num_heads, num_tokens, content_dim = spec.compute_transfer_shape(
+        region_content_bytes, block_size
+    )
+    if kv_cache_layout in ("NHD", "NHC"):
+        inner_strides = (
+            content_dim,
+            num_heads * content_dim,
+            1,
+        )
+    else:
+        inner_strides = (
+            num_tokens * content_dim,
+            content_dim,
+            1,
+        )
+    return torch.as_strided(
         torch.empty(1, dtype=dtype, device="meta"),
-        size=(num_blocks, H, N, C),
-        stride=(block_stride_bytes // elem, N * C, C, 1),
+        size=(num_blocks, num_heads, num_tokens, content_dim),
+        stride=(block_stride_bytes // elem, *inner_strides),
         storage_offset=0,
     )
-    return meta
 
 
-@dataclass
-class DescriptorView:
-    """One descriptor view in the flat descriptor list.
+def _jointly_contiguous_subviews(
+    local_view: torch.Tensor,
+    remote_view: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    if local_view.is_contiguous() and remote_view.is_contiguous():
+        yield local_view, remote_view
+        return
 
-    Each view owns a contiguous slice of the descriptor space.
-    Layout: [view0 descs | view1 descs | ...].
+    split_dim = next(dim for dim, size in enumerate(local_view.shape) if size > 1)
+    for local_part, remote_part in zip(
+        local_view.unbind(split_dim), remote_view.unbind(split_dim)
+    ):
+        yield from _jointly_contiguous_subviews(local_part, remote_part)
 
-    Per-region strides and contents are pre-computed at construction
-    so that builders can consume them without branching on spec type.
 
-    The number of descriptor streams per region is determined dynamically
-    by len(spec.slice_for_tp_transfer(...)) — not pre-computed.
+def jointly_contiguous_chunks(
+    local_view: torch.Tensor,
+    remote_view: torch.Tensor,
+) -> Iterator[tuple[int, int, int]]:
+    """Yield byte ranges that are contiguous in both logical views.
+
+    The block dimension is excluded. Returned offsets are relative to block zero
+    and include each view's storage offset.
     """
+    assert local_view.shape[1:] == remote_view.shape[1:]
+    assert local_view.element_size() == remote_view.element_size()
 
-    spec: KVCacheSpec
-    region_indices: list[int]
-    strides: list[int]
-    contents: list[int]
-    num_blocks: int
-    descs_per_region: int
+    elem = local_view.element_size()
+    local_block = local_view.select(_DIM4_B, 0)
+    remote_block = remote_view.select(_DIM4_B, 0)
 
-    @property
-    def num_view_regions(self) -> int:
-        return len(self.region_indices) * self.descs_per_region
-
-    def num_descs(self) -> int:
-        return self.num_view_regions * self.num_blocks
-
-    def remote_num_blocks(
-        self,
-        remote_kernel_blocks: int,
-        remote_physical_per_logical: int,
-    ) -> int:
-        if isinstance(self.spec, MambaSpec):
-            return remote_kernel_blocks // remote_physical_per_logical
-        return remote_kernel_blocks
-
-    def remote_stride(
-        self, remote_block_len: int, remote_physical_per_logical: int
-    ) -> int:
-        if isinstance(self.spec, MambaSpec):
-            return remote_block_len * remote_physical_per_logical
-        return remote_block_len
-
-    def remote_content(self, remote_block_len: int, remote_ssm_content: int) -> int:
-        if isinstance(self.spec, MambaSpec):
-            return remote_ssm_content
-        return remote_block_len
-
-
-# ---------------------------------------------------------------------------
-# Multi-view subclass
-# ---------------------------------------------------------------------------
+    pending: tuple[int, int, int] | None = None
+    for local_part, remote_part in _jointly_contiguous_subviews(
+        local_block, remote_block
+    ):
+        current = (
+            local_part.storage_offset() * elem,
+            remote_part.storage_offset() * elem,
+            local_part.numel() * elem,
+        )
+        if pending is None:
+            pending = current
+            continue
+        local_start, remote_start, length = pending
+        if current[0] == local_start + length and current[1] == remote_start + length:
+            pending = (local_start, remote_start, length + current[2])
+        else:
+            yield pending
+            pending = current
+    if pending is not None:
+        yield pending
 
 
 class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
-    """Extends NixlBaseConnectorWorker with unified DescriptorView logic.
-
-    Overrides:
-      - _on_kv_caches_registered  (builds DescriptorViews after region setup)
-      - _compute_desc_ids   (view-based offset computation)
-      - register_local_xfer_handler  (delegates to _build_view_local)
-      - add_remote_agent    (delegates to _build_view_remote)
-      - _build_local_splits_from_plan (view-aware splitting)
-    """
+    """Build matching local and remote descriptor lists during handshake."""
 
     def __init__(
         self,
@@ -155,12 +133,35 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        self._views: list[DescriptorView] = []
-        self._group_to_view_idx: dict[int, int] = {}
+        self._descs_per_block_per_group: tuple[int, ...] = ()
 
-    # ------------------------------------------------------------------
-    # Descriptor ID computation
-    # ------------------------------------------------------------------
+    def _group_specs(self) -> list[KVCacheSpec]:
+        specs: list[KVCacheSpec] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            specs.append(spec)
+        return specs
+
+    def _can_build_descriptor_pairs(self) -> bool:
+        local_bases = self.kv_caches_base_addr.get(self.engine_id, {})
+        return (
+            self.tp_rank in local_bases
+            and bool(local_bases[self.tp_rank])
+            and bool(self.spec_per_region)
+            and len(self.block_stride_per_layer) == len(self.spec_per_region)
+        )
+
+    def _group_num_blocks(
+        self,
+        spec: KVCacheSpec,
+        kernel_num_blocks: int,
+        physical_blocks_per_logical: int,
+    ) -> int:
+        if isinstance(spec, MambaSpec):
+            return kernel_num_blocks // physical_blocks_per_logical
+        return kernel_num_blocks
 
     def _compute_desc_ids(
         self,
@@ -168,286 +169,261 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
+        descs_per_block_per_group: tuple[int, ...] | None = None,
     ) -> np.ndarray:
-        """Compute NIXL descriptor IDs using per-view offsets."""
-        if self._is_packed_kv:
+        layout = descs_per_block_per_group or self._descs_per_block_per_group
+        if self._is_packed_kv or not layout:
             return super()._compute_desc_ids(
                 block_ids,
                 dst_num_blocks,
                 block_size_ratio,
                 physical_blocks_per_logical,
+                descs_per_block_per_group,
             )
-        kernel_blocks = dst_num_blocks
+
+        assert len(layout) == len(block_ids)
+        kernel_num_blocks = dst_num_blocks
         if block_size_ratio is not None:
-            kernel_blocks = int(kernel_blocks * block_size_ratio)
+            kernel_num_blocks = int(kernel_num_blocks * block_size_ratio)
 
-        view_offsets: list[int] = []
-        view_block_counts: list[int] = []
-        cumulative_offset = 0
-        for view in self._views:
-            view_offsets.append(cumulative_offset)
-            view_block_counts.append(
-                view.remote_num_blocks(kernel_blocks, physical_blocks_per_logical)
-            )
-            cumulative_offset += view.num_view_regions * view_block_counts[-1]
-
+        offset = 0
         all_descs: list[np.ndarray] = []
-        for group_idx, group_block_ids in enumerate(block_ids):
-            if group_idx not in self._group_to_view_idx:
-                raise ValueError(
-                    f"Unknown spec type {self._group_spec_types[group_idx]} "
-                    f"at group index {group_idx}"
-                )
-            view_idx = self._group_to_view_idx[group_idx]
+        for group_idx, (spec, group_block_ids) in enumerate(
+            zip(self._group_specs(), block_ids)
+        ):
+            num_blocks = self._group_num_blocks(
+                spec, kernel_num_blocks, physical_blocks_per_logical
+            )
+            num_streams = layout[group_idx]
             all_descs.append(
                 (
-                    view_offsets[view_idx]
-                    + np.arange(self._views[view_idx].num_view_regions)[:, None]
-                    * view_block_counts[view_idx]
+                    offset
+                    + np.arange(num_streams)[:, None] * num_blocks
                     + np.asarray(group_block_ids)[None, :]
                 ).flatten()
             )
-
+            offset += num_streams * num_blocks
         return np.concatenate(all_descs)
 
-    # ------------------------------------------------------------------
-    # View construction
-    # ------------------------------------------------------------------
-
-    def _build_descriptor_views(
-        self,
-    ) -> tuple[list[DescriptorView], dict[int, int]]:
-        """Create one DescriptorView per KV cache group.
-
-        Returns (views, group_to_view_idx).
-        Per-region strides and contents are pre-computed here so that
-        builders can consume them without branching on spec type.
-
-        descs_per_region is determined by calling slice_for_tp_transfer
-        with identical local TP params (homogeneous case) to count the
-        number of descriptor streams.
-        """
-        assert self.transfer_topo is not None
-        all_indices = list(range(len(self.spec_per_region)))
-
-        views: list[DescriptorView] = []
-        group_to_view: dict[int, int] = {}
-
-        for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                representative_spec = next(iter(group_spec.kv_cache_specs.values()))
-            else:
-                representative_spec = group_spec
-
-            if isinstance(representative_spec, MambaSpec):
-                strides = [
-                    self.block_len_per_layer[i]
-                    * self._physical_blocks_per_logical_kv_block
-                    for i in all_indices
-                ]
-                contents = [sum(self._mamba_ssm_size) for _ in all_indices]
-                num_blocks = self._logical_num_blocks
-            elif isinstance(representative_spec, AttentionSpec):
-                strides = [self.block_stride_per_layer[i] for i in all_indices]
-                contents = [self.block_len_per_layer[i] for i in all_indices]
-                num_blocks = self.num_blocks
-            else:
-                raise ValueError(
-                    f"Unsupported spec type for DescriptorView: "
-                    f"{type(representative_spec).__name__}"
-                )
-
-            # Determine descs_per_region by doing a probe slice with local TP.
-            probe_meta = build_region_meta(
-                spec=representative_spec,
-                num_blocks=1,
-                block_size=self.block_size,
-                block_stride_bytes=strides[0],
-                region_content_bytes=contents[0],
-            )
-            probe_slices = representative_spec.slice_for_tp_transfer(
-                probe_meta,
-                self.world_size,
-                self.tp_rank,
-                self.world_size,
-                self.tp_rank,
-                self.model_config,
-            )
-            descs_per_region = len(probe_slices)
-
-            views.append(
-                DescriptorView(
-                    spec=representative_spec,
-                    region_indices=all_indices,
-                    strides=strides,
-                    contents=contents,
-                    num_blocks=num_blocks,
-                    descs_per_region=descs_per_region,
-                )
-            )
-            group_to_view[group_idx] = len(views) - 1
-
-        return views, group_to_view
-
-    # ------------------------------------------------------------------
-    # Hook: build views after base class registers KV regions
-    # ------------------------------------------------------------------
-
-    def _on_kv_caches_registered(self) -> None:
-        """Build DescriptorViews after NIXL memory regions are registered."""
-        self._views, self._group_to_view_idx = self._build_descriptor_views()
-
-    # ------------------------------------------------------------------
-    # View-based local descriptor building
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _view_to_descriptors(
+    def _view_to_nixl_descriptors(
         view: torch.Tensor,
         base_addr: int,
         device_id: int,
     ) -> np.ndarray:
-        """Extract NIXL (addr, len, device_id) descriptors from a 4D meta.
-
-        Returns an Nx3 uint64 array matching the vectorized base class format.
-        """
-        elem = view.element_size()
-        block_stride = view.stride(_DIM4_B) * elem
-        payload = prod(view.shape[1:]) * elem
-        offset = view.storage_offset() * elem
-        num_blocks = view.shape[_DIM4_B]
-        addrs = (
-            base_addr + offset + np.arange(num_blocks, dtype=np.uint64) * block_stride
-        )
-        return NixlBaseConnectorWorker._stack_descs(addrs, payload, device_id)
-
-    def _build_view_local(
-        self,
-        view: DescriptorView,
-        base_addresses: list[int],
-        block_size_ratio: int,
-    ) -> np.ndarray:
-        """Build local descriptors for one view as an Nx3 uint64 array."""
-        if isinstance(view.spec, MambaSpec):
-            assert block_size_ratio == 1, (
-                "Mamba 3-read transfer with block_size_ratio != 1 "
-                f"is not tested. Got {block_size_ratio}."
-            )
-
-        num_blocks = view.num_blocks * block_size_ratio
+        block_stride = view.stride(_DIM4_B) * view.element_size()
+        block_offsets = np.arange(view.shape[_DIM4_B], dtype=np.uint64) * block_stride
         parts: list[np.ndarray] = []
-
-        for region_pos, region_idx in enumerate(view.region_indices):
-            meta = build_region_meta(
-                spec=view.spec,
-                num_blocks=num_blocks,
-                block_size=self.block_size,
-                block_stride_bytes=view.strides[region_pos] // block_size_ratio,
-                region_content_bytes=view.contents[region_pos] // block_size_ratio,
-            )
-            slices = view.spec.slice_for_tp_transfer(
-                meta,
-                self.world_size,
-                self.tp_rank,
-                self.world_size,
-                self.tp_rank,
-                self.model_config,
-            )
-            for slice_view in slices:
-                parts.append(
-                    self._view_to_descriptors(
-                        slice_view, base_addresses[region_idx], self.device_id
-                    )
+        for offset, _, length in jointly_contiguous_chunks(view, view):
+            parts.append(
+                NixlBaseConnectorWorker._stack_descs(
+                    base_addr + offset + block_offsets,
+                    length,
+                    device_id,
                 )
-
+            )
         return np.concatenate(parts)
+
+    @staticmethod
+    def _views_to_nixl_descriptors(
+        local_view: torch.Tensor,
+        remote_view: torch.Tensor,
+        local_base_addr: int,
+        remote_base_addr: int,
+        local_device_id: int,
+        remote_device_id: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        local_block_stride = local_view.stride(_DIM4_B) * local_view.element_size()
+        remote_block_stride = remote_view.stride(_DIM4_B) * remote_view.element_size()
+        local_block_offsets = (
+            np.arange(local_view.shape[_DIM4_B], dtype=np.uint64) * local_block_stride
+        )
+        remote_block_offsets = (
+            np.arange(remote_view.shape[_DIM4_B], dtype=np.uint64) * remote_block_stride
+        )
+        assert len(local_block_offsets) == len(remote_block_offsets)
+
+        local_parts: list[np.ndarray] = []
+        remote_parts: list[np.ndarray] = []
+        for local_offset, remote_offset, length in jointly_contiguous_chunks(
+            local_view, remote_view
+        ):
+            local_parts.append(
+                NixlBaseConnectorWorker._stack_descs(
+                    local_base_addr + local_offset + local_block_offsets,
+                    length,
+                    local_device_id,
+                )
+            )
+            remote_parts.append(
+                NixlBaseConnectorWorker._stack_descs(
+                    remote_base_addr + remote_offset + remote_block_offsets,
+                    length,
+                    remote_device_id,
+                )
+            )
+        return np.concatenate(local_parts), np.concatenate(remote_parts)
+
+    def _local_region_meta(
+        self,
+        spec: KVCacheSpec,
+        region_idx: int,
+        block_size_ratio: int,
+    ) -> torch.Tensor:
+        if isinstance(spec, MambaSpec):
+            assert block_size_ratio == 1
+            num_blocks = self._logical_num_blocks
+            stride = (
+                self.block_len_per_layer[region_idx]
+                * self._physical_blocks_per_logical_kv_block
+            )
+            content = sum(self._mamba_ssm_size)
+        elif isinstance(spec, AttentionSpec):
+            num_blocks = self.num_blocks * block_size_ratio
+            stride = self.block_stride_per_layer[region_idx] // block_size_ratio
+            content = self.block_len_per_layer[region_idx] // block_size_ratio
+        else:
+            raise ValueError(f"Unsupported KV cache spec: {type(spec).__name__}")
+        kv_cache_layout = (
+            self.host_buffer_kv_cache_layout
+            if self.use_host_buffer
+            else self.kv_cache_layout
+        )
+        return build_region_meta(
+            spec,
+            num_blocks,
+            self.block_size,
+            stride,
+            content,
+            kv_cache_layout,
+        )
+
+    def _remote_region_meta(
+        self,
+        spec: KVCacheSpec,
+        region_idx: int,
+        metadata: NixlAgentMetadata,
+        physical_blocks_per_logical: int,
+    ) -> torch.Tensor:
+        if isinstance(spec, MambaSpec):
+            num_blocks = metadata.num_blocks // physical_blocks_per_logical
+            stride = metadata.block_strides[region_idx] * physical_blocks_per_logical
+            content = sum(metadata.ssm_sizes)
+        elif isinstance(spec, AttentionSpec):
+            num_blocks = metadata.num_blocks
+            stride = metadata.block_strides[region_idx]
+            content = metadata.block_lens[region_idx]
+        else:
+            raise ValueError(f"Unsupported KV cache spec: {type(spec).__name__}")
+        return build_region_meta(
+            spec,
+            num_blocks,
+            metadata.block_size,
+            stride,
+            content,
+            metadata.kv_cache_layout,
+        )
+
+    def _build_descriptor_pair(
+        self,
+        metadata: NixlAgentMetadata,
+        block_size_ratio: int,
+        physical_blocks_per_logical: int,
+        remote_tp_size: int,
+        remote_tp_rank: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build descriptor lists in one pass and verify pairwise compatibility."""
+        local_parts: list[np.ndarray] = []
+        remote_parts: list[np.ndarray] = []
+        descs_per_block_per_group: list[int] = []
+        local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        local_size_and_rank = (self.world_size, self.tp_rank)
+        remote_size_and_rank = (remote_tp_size, remote_tp_rank)
+
+        for spec in self._group_specs():
+            group_descs_per_block = 0
+            for region_idx, local_base in enumerate(local_bases):
+                local_meta = self._local_region_meta(spec, region_idx, block_size_ratio)
+                remote_meta = self._remote_region_meta(
+                    spec,
+                    region_idx,
+                    metadata,
+                    physical_blocks_per_logical,
+                )
+                local_slices = spec.slice_for_tp_transfer(
+                    local_meta,
+                    *remote_size_and_rank,
+                    *local_size_and_rank,
+                    self.model_config,
+                )
+                remote_slices = spec.slice_for_tp_transfer(
+                    remote_meta,
+                    *local_size_and_rank,
+                    *remote_size_and_rank,
+                    self.model_config,
+                )
+                assert len(local_slices) == len(remote_slices)
+
+                for local_slice, remote_slice in zip(local_slices, remote_slices):
+                    local_descs, remote_descs = self._views_to_nixl_descriptors(
+                        local_slice,
+                        remote_slice,
+                        local_base,
+                        metadata.kv_caches_base_addr[region_idx],
+                        self.device_id,
+                        metadata.device_id,
+                    )
+                    assert len(local_descs) == len(remote_descs)
+                    assert np.array_equal(local_descs[:, 1], remote_descs[:, 1])
+                    group_descs_per_block += len(local_descs) // len(local_slice)
+                    local_parts.append(local_descs)
+                    remote_parts.append(remote_descs)
+            descs_per_block_per_group.append(group_descs_per_block)
+
+        descriptor_layout = tuple(descs_per_block_per_group)
+        self.xfer_descs_per_block_by_remote[metadata.engine_id][remote_tp_rank] = (
+            descriptor_layout
+        )
+        return np.concatenate(local_parts), np.concatenate(remote_parts)
 
     def register_local_xfer_handler(
         self,
         block_size: int,
     ) -> tuple[int, np.ndarray]:
-        """Register local xfer handler using multi-view descriptors."""
         if self._is_packed_kv:
             return super().register_local_xfer_handler(block_size)
-        assert self.transfer_topo is not None
+
         block_size_ratio = self.block_size // block_size
-        local_base_addresses = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
-
         parts: list[np.ndarray] = []
-        for view in self._views:
-            parts.append(
-                self._build_view_local(view, local_base_addresses, block_size_ratio)
-            )
-        blocks_data = np.concatenate(parts)
-
-        expected_descs = sum(v.num_descs() for v in self._views) * block_size_ratio
-        assert len(blocks_data) == expected_descs, (
-            f"View descriptor count mismatch: built {len(blocks_data)} descs, "
-            f"expected {expected_descs} (views={len(self._views)}, "
-            f"block_size_ratio={block_size_ratio})"
-        )
-
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
-        return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
-
-    # ------------------------------------------------------------------
-    # View-based remote descriptor building
-    # ------------------------------------------------------------------
-
-    def _build_view_remote(
-        self,
-        view: DescriptorView,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_physical_per_logical: int,
-        remote_tp_rank: int,
-        remote_tp_size: int,
-    ) -> np.ndarray:
-        """Build remote descriptors for one view as an Nx3 uint64 array."""
-        assert self.transfer_topo is not None
-        num_blocks = view.remote_num_blocks(
-            nixl_agent_meta.num_blocks, remote_physical_per_logical
-        )
-        parts: list[np.ndarray] = []
-
-        for region_pos, region_idx in enumerate(view.region_indices):
-            meta = build_region_meta(
-                spec=view.spec,
-                num_blocks=num_blocks,
-                block_size=nixl_agent_meta.block_size,
-                block_stride_bytes=view.remote_stride(
-                    nixl_agent_meta.block_strides[region_idx],
-                    remote_physical_per_logical,
-                ),
-                region_content_bytes=view.remote_content(
-                    nixl_agent_meta.block_lens[region_idx],
-                    sum(nixl_agent_meta.ssm_sizes),
-                ),
-            )
-            slices = view.spec.slice_for_tp_transfer(
-                meta,
-                self.transfer_topo.tp_size,
-                self.transfer_topo.tp_rank,
-                remote_tp_size,
-                remote_tp_rank,
-                self.model_config,
-            )
-            for slice_view in slices:
-                parts.append(
-                    self._view_to_descriptors(
-                        slice_view,
-                        nixl_agent_meta.kv_caches_base_addr[region_idx],
-                        nixl_agent_meta.device_id,
-                    )
+        descs_per_block_per_group: list[int] = []
+        local_bases = self.kv_caches_base_addr[self.engine_id][self.tp_rank]
+        for spec in self._group_specs():
+            group_descs_per_block = 0
+            for region_idx, base_addr in enumerate(local_bases):
+                meta = self._local_region_meta(spec, region_idx, block_size_ratio)
+                slices = spec.slice_for_tp_transfer(
+                    meta,
+                    self.world_size,
+                    self.tp_rank,
+                    self.world_size,
+                    self.tp_rank,
+                    self.model_config,
                 )
+                for view in slices:
+                    view_descs = self._view_to_nixl_descriptors(
+                        view, base_addr, self.device_id
+                    )
+                    group_descs_per_block += len(view_descs) // len(view)
+                    parts.append(view_descs)
+            descs_per_block_per_group.append(group_descs_per_block)
 
-        return np.concatenate(parts)
+        self._descs_per_block_per_group = tuple(descs_per_block_per_group)
+        blocks_data = np.concatenate(parts)
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        handle = self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        return handle, blocks_data
 
-    # ------------------------------------------------------------------
-    # Remote descriptor building override
-    # ------------------------------------------------------------------
-
-    def _build_all_remote_descs(
+    def _build_xfer_descs(
         self,
         nixl_agent_meta: NixlAgentMetadata,
         plan: TPMapping,
@@ -457,10 +433,13 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         physical_blocks_per_logical: int,
         remote_tp_rank: int,
         remote_tp_size: int,
-    ) -> np.ndarray:
-        """Build remote descriptors using multi-view layout."""
-        if self._is_packed_kv:
-            return super()._build_all_remote_descs(
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        if (
+            self._is_packed_kv
+            or block_size_ratio != 1
+            or not self._can_build_descriptor_pairs()
+        ):
+            return super()._build_xfer_descs(
                 nixl_agent_meta,
                 plan,
                 block_size_ratio,
@@ -471,22 +450,13 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
                 remote_tp_size,
             )
 
-        parts: list[np.ndarray] = []
-        for view in self._views:
-            parts.append(
-                self._build_view_remote(
-                    view,
-                    nixl_agent_meta,
-                    physical_blocks_per_logical,
-                    remote_tp_rank=remote_tp_rank,
-                    remote_tp_size=remote_tp_size,
-                )
-            )
-        return np.concatenate(parts)
-
-    # ------------------------------------------------------------------
-    # _build_local_splits_from_plan override
-    # ------------------------------------------------------------------
+        return self._build_descriptor_pair(
+            nixl_agent_meta,
+            block_size_ratio,
+            physical_blocks_per_logical,
+            remote_tp_size,
+            remote_tp_rank,
+        )
 
     def _build_local_splits_from_plan(
         self,
@@ -494,61 +464,10 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         src_blocks_data: np.ndarray,
         num_fa_descs: int | None = None,
     ) -> Iterator[list[tuple[int, int, int]]]:
-        """Build split handle data for P_TP > D_TP using view layout.
-
-        Unlike the base class which uses a flat num_fa_descs boundary,
-        this iterates per-view to determine split counts and slot
-        mappings, making it independent of view ordering.
-        """
-        if self._is_packed_kv:
+        if self._is_packed_kv or not self._can_build_descriptor_pairs():
             yield from super()._build_local_splits_from_plan(
                 plan,
                 src_blocks_data,
                 num_fa_descs if num_fa_descs is not None else 0,
             )
-            return
-
-        src_blocks_list = src_blocks_data.tolist()
-
-        # Per-view: (start, end, num_splits, rank_to_slot).
-        view_info: list[tuple[int, int, int, dict[int, int]]] = []
-        position = 0
-        for view_idx, view in enumerate(self._views):
-            representative_group = next(
-                group_idx
-                for group_idx, mapped in self._group_to_view_idx.items()
-                if mapped == view_idx
-            )
-            if isinstance(view.spec, MambaSpec):
-                rank_to_slot = {r: idx for idx, r in enumerate(plan.all_source_ranks)}
-                num_splits = len(plan.source_ranks_per_group[representative_group])
-            else:
-                rank_to_slot = {
-                    r: plan.rank_to_attention_slot.get(r, 0)
-                    for r in plan.all_source_ranks
-                }
-                num_splits = len(
-                    set(
-                        plan.rank_to_attention_slot[r]
-                        for r in plan.source_ranks_per_group[representative_group]
-                    )
-                )
-            view_info.append(
-                (
-                    position,
-                    position + view.num_descs(),
-                    num_splits,
-                    rank_to_slot,
-                )
-            )
-            position += view.num_descs()
-
-        for _source_idx, source_rank in enumerate(plan.all_source_ranks):
-            handle: list[tuple[int, int, int]] = []
-            for start, end, num_splits, rank_to_slot in view_info:
-                slot = rank_to_slot[source_rank]
-                for j in range(start, end):
-                    addr, local_len, dev = src_blocks_list[j]
-                    chunk = local_len // num_splits
-                    handle.append((addr + slot * chunk, chunk, dev))
-            yield handle
+        # Non-packed local slices are built directly with their remote peers.

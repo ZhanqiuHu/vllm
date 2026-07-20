@@ -94,6 +94,7 @@ class NixlBaseConnectorWorker:
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
+        descs_per_block_per_group: tuple[int, ...] | None = None,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs."""
         num_fa_regions = self.num_regions
@@ -156,6 +157,13 @@ class NixlBaseConnectorWorker:
                 )
 
         return np.concatenate(all_descs)
+
+    def _get_xfer_descs_per_block(
+        self, engine_id: EngineId, remote_tp_rank: int
+    ) -> tuple[int, ...] | None:
+        return self.xfer_descs_per_block_by_remote.get(engine_id, {}).get(
+            remote_tp_rank
+        )
 
     def _build_local_splits_from_plan(
         self,
@@ -446,6 +454,10 @@ class NixlBaseConnectorWorker:
         # Populated dynamically during handshake based on remote configuration.
         # Keep track of regions at different tp_ratio values. tp_ratio->handles
         self.src_xfer_handles_by_tp_ratio: dict[int, list[int]] = {}
+        self.src_xfer_handles_by_remote = defaultdict[EngineId, dict[int, int]](dict)
+        self.xfer_descs_per_block_by_remote = defaultdict[
+            EngineId, dict[int, tuple[int, ...]]
+        ](dict)
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
 
@@ -1496,6 +1508,25 @@ class NixlBaseConnectorWorker:
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
+    def _get_local_xfer_side_handle(
+        self,
+        engine_id: str,
+        remote_tp_rank: int,
+        remote_block_size: int,
+        tp_ratio: int,
+        source_index: int,
+    ) -> int:
+        """Return the local descriptor handle paired with a remote rank."""
+        paired_handle = self.src_xfer_handles_by_remote.get(engine_id, {}).get(
+            remote_tp_rank
+        )
+        if paired_handle is not None:
+            return paired_handle
+        if tp_ratio < 0 and not self.use_mla:
+            assert remote_block_size == self.block_size
+            return self.src_xfer_handles_by_tp_ratio[tp_ratio][source_index]
+        return self.src_xfer_handles_by_block_size[remote_block_size]
+
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
@@ -1653,7 +1684,7 @@ class NixlBaseConnectorWorker:
                 self.src_xfer_handles_by_tp_ratio[tp_ratio].append(handle)
 
         ### Register remote agent memory regions
-        blocks_data = self._build_all_remote_descs(
+        local_blocks_data, remote_blocks_data = self._build_xfer_descs(
             nixl_agent_meta,
             plan,
             block_size_ratio,
@@ -1664,8 +1695,19 @@ class NixlBaseConnectorWorker:
             remote_tp_size,
         )
 
+        if local_blocks_data is not None:
+            local_descs = self.nixl_wrapper.get_xfer_descs(
+                local_blocks_data, self.nixl_memory_type
+            )
+            local_handle = self.nixl_wrapper.prep_xfer_dlist(
+                "NIXL_INIT_AGENT", local_descs
+            )
+            self.src_xfer_handles_by_remote[engine_id][remote_tp_rank] = local_handle
+
         # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        descs = self.nixl_wrapper.get_xfer_descs(
+            remote_blocks_data, self.nixl_memory_type
+        )
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
@@ -1678,6 +1720,32 @@ class NixlBaseConnectorWorker:
             )
 
         return remote_agent_name
+
+    def _build_xfer_descs(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        plan: TPMapping,
+        block_size_ratio: int,
+        tp_ratio: int,
+        transfer_info: EngineTransferInfo,
+        physical_blocks_per_logical: int,
+        remote_tp_rank: int,
+        remote_tp_size: int,
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        """Build optional paired local descriptors and remote descriptors."""
+        return (
+            None,
+            self._build_all_remote_descs(
+                nixl_agent_meta,
+                plan,
+                block_size_ratio,
+                tp_ratio,
+                transfer_info,
+                physical_blocks_per_logical,
+                remote_tp_rank,
+                remote_tp_size,
+            ),
+        )
 
     def _build_all_remote_descs(
         self,
@@ -2456,6 +2524,9 @@ class NixlBaseConnectorWorker:
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
+        for handle in self.src_xfer_handles_by_remote.pop(engine_id, {}).values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        self.xfer_descs_per_block_by_remote.pop(engine_id, None)
         for agent_name in self._remote_agents.pop(engine_id).values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
 
