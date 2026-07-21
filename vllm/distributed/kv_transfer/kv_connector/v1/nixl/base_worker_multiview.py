@@ -85,61 +85,23 @@ def _stride_order_for_layout(
     return (0, 1, 2, 3)
 
 
-def _jointly_contiguous_subviews(
+def jointly_contiguous_subviews(
     local_view: torch.Tensor,
     remote_view: torch.Tensor,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield minimal paired chunks for dense cache subviews."""
     if local_view.is_contiguous() and remote_view.is_contiguous():
         yield local_view, remote_view
         return
 
-    split_dim = next(dim for dim, size in enumerate(local_view.shape) if size > 1)
+    split_dim = max(
+        (dim for dim, size in enumerate(local_view.shape) if size > 1),
+        key=lambda dim: max(local_view.stride(dim), remote_view.stride(dim)),
+    )
     for local_part, remote_part in zip(
         local_view.unbind(split_dim), remote_view.unbind(split_dim)
     ):
-        yield from _jointly_contiguous_subviews(local_part, remote_part)
-
-
-def jointly_contiguous_chunks(
-    local_view: torch.Tensor,
-    remote_view: torch.Tensor,
-) -> Iterator[tuple[slice, slice]]:
-    """Yield paired byte slices contiguous in both logical views.
-
-    The block dimension is excluded. Slice bounds are relative to block zero and
-    include each view's storage offset.
-    """
-    assert local_view.shape[1:] == remote_view.shape[1:]
-    assert local_view.element_size() == remote_view.element_size()
-
-    elem = local_view.element_size()
-    local_block = local_view.select(_DIM4_B, 0)
-    remote_block = remote_view.select(_DIM4_B, 0)
-
-    pending: tuple[slice, slice] | None = None
-    for local_part, remote_part in _jointly_contiguous_subviews(
-        local_block, remote_block
-    ):
-        length = local_part.numel() * elem
-        local_start = local_part.storage_offset() * elem
-        remote_start = remote_part.storage_offset() * elem
-        current = (
-            slice(local_start, local_start + length),
-            slice(remote_start, remote_start + length),
-        )
-        if pending is None:
-            pending = current
-            continue
-        if current[0].start == pending[0].stop and current[1].start == pending[1].stop:
-            pending = (
-                slice(pending[0].start, current[0].stop),
-                slice(pending[1].start, current[1].stop),
-            )
-        else:
-            yield pending
-            pending = current
-    if pending is not None:
-        yield pending
+        yield from jointly_contiguous_subviews(local_part, remote_part)
 
 
 def _stack_nixl_descriptors(
@@ -266,30 +228,34 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             np.arange(remote_view.shape[_DIM4_B], dtype=np.uint64) * remote_block_stride
         )
 
-        chunks_per_subblock = [
-            list(jointly_contiguous_chunks(local_view, remote_view))
+        assert all(view.shape[1:] == remote_view.shape[1:] for view in local_views)
+        assert all(
+            view.element_size() == remote_view.element_size() for view in local_views
+        )
+        remote_block = remote_view.select(_DIM4_B, 0)
+        chunk_streams = [
+            jointly_contiguous_subviews(local_view.select(_DIM4_B, 0), remote_block)
             for local_view in local_views
         ]
-        num_chunks = len(chunks_per_subblock[0])
-        assert all(len(chunks) == num_chunks for chunks in chunks_per_subblock)
 
         local_parts: list[np.ndarray] = []
         remote_parts: list[np.ndarray] = []
-        for chunk_idx in range(num_chunks):
-            chunk_group = [chunks[chunk_idx] for chunks in chunks_per_subblock]
-            remote_slice = chunk_group[0][1]
-            remote_offset = remote_slice.start
-            remote_stop = remote_slice.stop
-            assert isinstance(remote_offset, int)
-            assert isinstance(remote_stop, int)
-            length = remote_stop - remote_offset
-            assert all(chunk[1] == remote_slice for chunk in chunk_group)
-            local_slices = [chunk[0] for chunk in chunk_group]
+        for chunk_group in zip(*chunk_streams, strict=True):
+            local_chunks, remote_chunks = zip(*chunk_group)
+            remote_chunk = remote_chunks[0]
             assert all(
-                isinstance(local_slice.start, int) for local_slice in local_slices
+                chunk.storage_offset() == remote_chunk.storage_offset()
+                and chunk.numel() == remote_chunk.numel()
+                for chunk in remote_chunks
             )
+            remote_offset = remote_chunk.storage_offset() * remote_chunk.element_size()
+            length = remote_chunk.numel() * remote_chunk.element_size()
             subblock_offsets = np.asarray(
-                [local_slice.start for local_slice in local_slices], dtype=np.uint64
+                [
+                    chunk.storage_offset() * chunk.element_size()
+                    for chunk in local_chunks
+                ],
+                dtype=np.uint64,
             )
             local_addrs = (
                 local_base_addr
