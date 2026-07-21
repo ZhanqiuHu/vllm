@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
@@ -93,6 +94,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     ) -> FusedMoEQuantConfig | None:
         return self.moe_quant_config
 
+    @eager_break_during_capture
     def apply(
         self,
         layer: "RoutedExperts",
@@ -103,7 +105,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
+        result = self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -116,3 +118,18 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+        if not hasattr(self, "_static_moe_outputs"):
+            from vllm.compilation.breakable_cudagraph import (
+                is_breakable_cudagraph_enabled)
+            self._use_static_output = is_breakable_cudagraph_enabled()
+            self._static_moe_outputs = {}
+        if self._use_static_output:
+            key = (result.shape, result.dtype, result.device.index)
+            buf = self._static_moe_outputs.get(key)
+            if buf is None:
+                buf = result.clone()
+                self._static_moe_outputs[key] = buf
+            else:
+                buf.copy_(result)
+            return buf
+        return result
