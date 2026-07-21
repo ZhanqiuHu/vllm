@@ -2044,20 +2044,12 @@ class DPEngineCoreProc(EngineCoreProc):
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             if not executed:
-                if not local_unfinished_reqs and not self.engines_running:
-                    # All engines are idle.
-                    continue
-
-                # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping.
-                elif not self.model_executor.is_sleeping:
-                    with self.capture_iteration_details(None) as iteration_details:
-                        self.execute_dummy_batch()
-                    if iteration_details is not None and not self.has_coordinator:
-                        stats = self._make_iteration_details_stats(iteration_details)
-                        self.output_queue.put_nowait(
-                            (0, EngineCoreOutputs(scheduler_stats=stats))
-                        )
+                # Always execute dummy batch to participate in DP
+                # coordination (coordinate_batch_across_dp). Without this,
+                # an idle DP rank never calls coordinate_batch_across_dp,
+                # causing the active rank to deadlock on the all-reduce.
+                if not self.model_executor.is_sleeping:
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
@@ -2087,10 +2079,9 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # Always sync DP state to prevent stale engines_running from
+        # causing idle ranks to skip coordination.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
-            return True
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
