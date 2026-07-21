@@ -166,7 +166,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if self.use_mla and tp_ratio < 0:
             assert len(read_specs) == 1
 
-        for i, spec in enumerate(read_specs):
+        for spec in read_specs:
             remote_block_size = remote_info.remote_block_size
             logger.debug(
                 "Remote agent %s available, calling _read_blocks"
@@ -177,17 +177,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
             )
             # Get side handles.
-            if tp_ratio < 0 and not self.use_mla:
-                assert remote_block_size == self.block_size
-                # Remote tp_size > local tp_size: we must perform multiple
-                # reads. Get the memory chunk onto which we will write to.
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
-            else:
-                # Single read from remote, we write to the whole memory region.
-                # Also handle remote block size different from local block size.
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
+            local_xfer_side_handle = self.src_xfer_handles_by_remote[
+                meta.remote.engine_id
+            ][spec.remote_rank]
 
             # Destination handle: remote_engine_id -> remote_rank -> handle.
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
@@ -302,6 +294,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids, remote_block_ids = self._apply_prefix_caching(
             local_block_ids, remote_block_ids, remote_physical_per_logical
         )
+        descs_per_block_per_group = self._get_xfer_descs_per_block(
+            dst_engine_id, remote_rank
+        )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
@@ -313,12 +308,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            descs_per_block_per_group=descs_per_block_per_group,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            descs_per_block_per_group=descs_per_block_per_group,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
