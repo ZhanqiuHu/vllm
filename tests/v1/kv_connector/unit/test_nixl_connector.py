@@ -3,6 +3,7 @@
 
 import contextlib
 import inspect
+import itertools
 import os
 import tempfile
 import textwrap
@@ -42,6 +43,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker_multiview import (
     NixlBaseConnectorWorkerMultiview,
+    build_region_meta,
     jointly_contiguous_chunks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -205,6 +207,67 @@ def test_joint_descriptors_map_smaller_remote_blocks():
         1014,
     ]
     assert local_descs[:, 1].tolist() == remote_descs[:, 1].tolist()
+
+
+def test_joint_descriptors_map_cross_layer_hnd_to_nhd():
+    """Descriptors preserve logical coordinates across 5D physical layouts."""
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=2,
+        head_size=1,
+        dtype=torch.uint8,
+    )
+    local = build_region_meta(
+        spec,
+        num_blocks=2,
+        block_size=2,
+        block_stride_bytes=24,
+        region_content_bytes=24,
+        kv_cache_layout="HND",
+        layers_per_region=3,
+    )
+    remote = build_region_meta(
+        spec,
+        num_blocks=2,
+        block_size=2,
+        block_stride_bytes=24,
+        region_content_bytes=24,
+        kv_cache_layout="NHD",
+        layers_per_region=3,
+    )
+    assert local.shape == remote.shape == (2, 2, 3, 2, 2)
+
+    local_storage = bytearray(48)
+    remote_storage = bytearray(48)
+    logical_indices = itertools.product(*(range(size) for size in local.shape))
+    for value, index in enumerate(logical_indices, start=1):
+        remote_offset = sum(i * stride for i, stride in zip(index, remote.stride()))
+        remote_storage[remote_offset] = value
+
+    local_descs, remote_descs = (
+        NixlBaseConnectorWorkerMultiview._views_to_nixl_descriptors(
+            local,
+            remote,
+            local_base_addr=0,
+            remote_base_addr=0,
+            local_device_id=0,
+            remote_device_id=1,
+        )
+    )
+    assert len(local_descs) == len(remote_descs)
+    for local_desc, remote_desc in zip(local_descs, remote_descs):
+        local_offset, length, _ = local_desc
+        remote_offset, remote_length, _ = remote_desc
+        assert length == remote_length
+        local_storage[local_offset : local_offset + length] = remote_storage[
+            remote_offset : remote_offset + remote_length
+        ]
+
+    logical_indices = itertools.product(*(range(size) for size in local.shape))
+    for index in logical_indices:
+        local_offset = sum(i * stride for i, stride in zip(index, local.stride()))
+        remote_offset = sum(i * stride for i, stride in zip(index, remote.stride()))
+        assert local_storage[local_offset] == remote_storage[remote_offset]
 
 
 @pytest.fixture(scope="module", autouse=True)

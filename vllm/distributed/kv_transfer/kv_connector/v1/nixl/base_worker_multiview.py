@@ -48,7 +48,7 @@ def build_region_meta(
     """Build a ``(B, H, N, C)`` metadata tensor for a cache region."""
     dtype = getattr(spec, "dtype", torch.int8)
     elem = get_dtype_size(dtype)
-    num_heads, num_tokens, content_dim = spec.compute_transfer_shape(
+    H, N, C = spec.compute_transfer_shape(
         region_content_bytes // layers_per_region, block_size
     )
     size: tuple[int, ...]
@@ -56,37 +56,37 @@ def build_region_meta(
     if layers_per_region > 1 and kv_cache_layout in ("NHD", "NHC"):
         size = (
             num_blocks,
-            num_heads,
+            H,
             layers_per_region,
-            num_tokens,
-            content_dim,
+            N,
+            C,
         )
         inner_strides = (
-            content_dim,
-            num_tokens * num_heads * content_dim,
-            num_heads * content_dim,
+            C,
+            N * H * C,
+            H * C,
             1,
         )
     elif layers_per_region > 1:
         size = (
             num_blocks,
-            num_heads,
+            H,
             layers_per_region,
-            num_tokens,
-            content_dim,
+            N,
+            C,
         )
         inner_strides = (
-            layers_per_region * num_tokens * content_dim,
-            num_tokens * content_dim,
-            content_dim,
+            layers_per_region * N * C,
+            N * C,
+            C,
             1,
         )
     elif kv_cache_layout in ("NHD", "NHC"):
-        size = (num_blocks, num_heads, num_tokens, content_dim)
-        inner_strides = (content_dim, num_heads * content_dim, 1)
+        size = (num_blocks, H, N, C)
+        inner_strides = (C, H * C, 1)
     else:
-        size = (num_blocks, num_heads, num_tokens, content_dim)
-        inner_strides = (num_tokens * content_dim, content_dim, 1)
+        size = (num_blocks, H, N, C)
+        inner_strides = (N * C, C, 1)
     return torch.as_strided(
         torch.empty(1, dtype=dtype, device="meta"),
         size=size,
