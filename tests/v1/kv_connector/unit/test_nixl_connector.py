@@ -223,7 +223,7 @@ def test_joint_descriptors_map_cross_layer_hnd_to_nhd():
         block_size=2,
         block_stride_bytes=24,
         region_content_bytes=24,
-        kv_cache_layout="HND",
+        stride_order=(0, 1, 2, 3, 4),
         layers_per_region=3,
     )
     remote = build_region_meta(
@@ -232,7 +232,7 @@ def test_joint_descriptors_map_cross_layer_hnd_to_nhd():
         block_size=2,
         block_stride_bytes=24,
         region_content_bytes=24,
-        kv_cache_layout="NHD",
+        stride_order=(0, 2, 3, 1, 4),
         layers_per_region=3,
     )
     assert local.shape == remote.shape == (2, 2, 3, 2, 2)

@@ -42,57 +42,47 @@ def build_region_meta(
     block_size: int,
     block_stride_bytes: int,
     region_content_bytes: int,
-    kv_cache_layout: str = "HND",
+    stride_order: tuple[int, ...],
     layers_per_region: int = 1,
 ) -> torch.Tensor:
-    """Build a ``(B, H, N, C)`` metadata tensor for a cache region."""
+    """Build a logical cache-region view with the requested stride order."""
     dtype = getattr(spec, "dtype", torch.int8)
     elem = get_dtype_size(dtype)
     H, N, C = spec.compute_transfer_shape(
         region_content_bytes // layers_per_region, block_size
     )
-    size: tuple[int, ...]
-    inner_strides: tuple[int, ...]
-    if layers_per_region > 1 and kv_cache_layout in ("NHD", "NHC"):
-        size = (
-            num_blocks,
-            H,
-            layers_per_region,
-            N,
-            C,
-        )
-        inner_strides = (
-            C,
-            N * H * C,
-            H * C,
-            1,
-        )
-    elif layers_per_region > 1:
-        size = (
-            num_blocks,
-            H,
-            layers_per_region,
-            N,
-            C,
-        )
-        inner_strides = (
-            layers_per_region * N * C,
-            N * C,
-            C,
-            1,
-        )
-    elif kv_cache_layout in ("NHD", "NHC"):
-        size = (num_blocks, H, N, C)
-        inner_strides = (C, H * C, 1)
-    else:
-        size = (num_blocks, H, N, C)
-        inner_strides = (N * C, C, 1)
+    size = (
+        (num_blocks, H, layers_per_region, N, C)
+        if layers_per_region > 1
+        else (num_blocks, H, N, C)
+    )
+    assert sorted(stride_order) == list(range(len(size)))
+    assert stride_order[0] == _DIM4_B
+
+    strides = [0] * len(size)
+    running_stride = 1
+    for dim in reversed(stride_order):
+        strides[dim] = running_stride
+        running_stride *= size[dim]
+    strides[_DIM4_B] = block_stride_bytes // elem
     return torch.as_strided(
         torch.empty(1, dtype=dtype, device="meta"),
         size=size,
-        stride=(block_stride_bytes // elem, *inner_strides),
+        stride=strides,
         storage_offset=0,
     )
+
+
+def _stride_order_for_layout(
+    kv_cache_layout: str, layers_per_region: int
+) -> tuple[int, ...]:
+    if layers_per_region > 1:
+        if kv_cache_layout in ("NHD", "NHC"):
+            return (0, 2, 3, 1, 4)
+        return (0, 1, 2, 3, 4)
+    if kv_cache_layout in ("NHD", "NHC"):
+        return (0, 2, 1, 3)
+    return (0, 1, 2, 3)
 
 
 def _jointly_contiguous_subviews(
@@ -349,7 +339,7 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             self.block_size,
             stride,
             content,
-            kv_cache_layout,
+            _stride_order_for_layout(kv_cache_layout, layers_per_region),
             layers_per_region,
         )
         if block_size_ratio == 1:
@@ -394,7 +384,7 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             metadata.block_size,
             stride,
             content,
-            metadata.kv_cache_layout,
+            _stride_order_for_layout(metadata.kv_cache_layout, layers_per_region),
             layers_per_region,
         )
 
