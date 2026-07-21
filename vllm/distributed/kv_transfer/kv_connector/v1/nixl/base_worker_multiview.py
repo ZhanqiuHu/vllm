@@ -85,23 +85,23 @@ def _stride_order_for_layout(
     return (0, 1, 2, 3)
 
 
-def jointly_contiguous_subviews(
-    local_view: torch.Tensor,
-    remote_view: torch.Tensor,
-) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    """Yield minimal paired chunks for dense cache subviews."""
-    if local_view.is_contiguous() and remote_view.is_contiguous():
-        yield local_view, remote_view
+def jointly_contiguous_chunks(
+    *views: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, ...]]:
+    """Yield minimal jointly contiguous chunks for dense cache views."""
+    assert len(views) >= 2
+    assert all(view.shape == views[0].shape for view in views[1:])
+    assert all(view.element_size() == views[0].element_size() for view in views[1:])
+    if all(view.is_contiguous() for view in views):
+        yield views
         return
 
     split_dim = max(
-        (dim for dim, size in enumerate(local_view.shape) if size > 1),
-        key=lambda dim: max(local_view.stride(dim), remote_view.stride(dim)),
+        (dim for dim, size in enumerate(views[0].shape) if size > 1),
+        key=lambda dim: max(view.stride(dim) for view in views),
     )
-    for local_part, remote_part in zip(
-        local_view.unbind(split_dim), remote_view.unbind(split_dim)
-    ):
-        yield from jointly_contiguous_subviews(local_part, remote_part)
+    for parts in zip(*(view.unbind(split_dim) for view in views), strict=True):
+        yield from jointly_contiguous_chunks(*parts)
 
 
 def _stack_nixl_descriptors(
@@ -228,26 +228,14 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
             np.arange(remote_view.shape[_DIM4_B], dtype=np.uint64) * remote_block_stride
         )
 
-        assert all(view.shape[1:] == remote_view.shape[1:] for view in local_views)
-        assert all(
-            view.element_size() == remote_view.element_size() for view in local_views
-        )
+        local_blocks = tuple(view.select(_DIM4_B, 0) for view in local_views)
         remote_block = remote_view.select(_DIM4_B, 0)
-        chunk_streams = [
-            jointly_contiguous_subviews(local_view.select(_DIM4_B, 0), remote_block)
-            for local_view in local_views
-        ]
 
         local_parts: list[np.ndarray] = []
         remote_parts: list[np.ndarray] = []
-        for chunk_group in zip(*chunk_streams, strict=True):
-            local_chunks, remote_chunks = zip(*chunk_group)
-            remote_chunk = remote_chunks[0]
-            assert all(
-                chunk.storage_offset() == remote_chunk.storage_offset()
-                and chunk.numel() == remote_chunk.numel()
-                for chunk in remote_chunks
-            )
+        for *local_chunks, remote_chunk in jointly_contiguous_chunks(
+            *local_blocks, remote_block
+        ):
             remote_offset = remote_chunk.storage_offset() * remote_chunk.element_size()
             length = remote_chunk.numel() * remote_chunk.element_size()
             subblock_offsets = np.asarray(

@@ -44,7 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker_multiview import (
     NixlBaseConnectorWorkerMultiview,
     build_region_meta,
-    jointly_contiguous_subviews,
+    jointly_contiguous_chunks,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     compute_nixl_compatibility_hash,
@@ -82,21 +82,21 @@ from .utils import (
 )
 
 
-def test_jointly_contiguous_subviews_coalesces_shared_layout():
+def test_jointly_contiguous_chunks_coalesces_shared_layout():
     view = torch.as_strided(
         torch.empty(1, dtype=torch.uint8, device="meta"),
         size=(2, 2, 3, 4),
         stride=(24, 12, 4, 1),
     )
 
-    chunks = list(jointly_contiguous_subviews(view[0], view[0]))
+    chunks = list(jointly_contiguous_chunks(view[0], view[0]))
     assert [
         (local.storage_offset(), remote.storage_offset(), local.numel())
         for local, remote in chunks
     ] == [(0, 0, 24)]
 
 
-def test_jointly_contiguous_subviews_splits_different_layouts():
+def test_jointly_contiguous_chunks_splits_different_layouts():
     local = torch.as_strided(
         torch.empty(1, dtype=torch.uint8, device="meta"),
         size=(2, 2, 3, 4),
@@ -108,7 +108,7 @@ def test_jointly_contiguous_subviews_splits_different_layouts():
         stride=(24, 4, 8, 1),
     )
 
-    chunks = list(jointly_contiguous_subviews(local[0], remote[0]))
+    chunks = list(jointly_contiguous_chunks(local[0], remote[0]))
     assert [
         (local.storage_offset(), remote.storage_offset(), local.numel())
         for local, remote in chunks
@@ -138,7 +138,7 @@ def test_jointly_contiguous_subviews_splits_different_layouts():
     ]
 
 
-def test_jointly_contiguous_subviews_splits_largest_stride_first():
+def test_jointly_contiguous_chunks_splits_largest_stride_first():
     local = torch.as_strided(
         torch.empty(1, dtype=torch.uint8, device="meta"),
         size=(1, 5, 1, 3),
@@ -150,7 +150,7 @@ def test_jointly_contiguous_subviews_splits_largest_stride_first():
         stride=(7, 1, 14, 70),
     )
 
-    chunks = list(jointly_contiguous_subviews(local, remote))
+    chunks = list(jointly_contiguous_chunks(local, remote))
     assert len(chunks) == 3
     assert all(local.numel() == remote.numel() == 5 for local, remote in chunks)
 
