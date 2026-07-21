@@ -89,7 +89,7 @@ def test_jointly_contiguous_chunks_coalesces_shared_layout():
         stride=(24, 12, 4, 1),
     )
 
-    assert list(jointly_contiguous_chunks(view, view)) == [(0, 0, 24)]
+    assert list(jointly_contiguous_chunks(view, view)) == [(slice(0, 24), slice(0, 24))]
 
 
 def test_jointly_contiguous_chunks_splits_different_layouts():
@@ -105,12 +105,12 @@ def test_jointly_contiguous_chunks_splits_different_layouts():
     )
 
     assert list(jointly_contiguous_chunks(local, remote)) == [
-        (0, 0, 4),
-        (4, 8, 4),
-        (8, 16, 4),
-        (12, 4, 4),
-        (16, 12, 4),
-        (20, 20, 4),
+        (slice(0, 4), slice(0, 4)),
+        (slice(4, 8), slice(8, 12)),
+        (slice(8, 12), slice(16, 20)),
+        (slice(12, 16), slice(4, 8)),
+        (slice(16, 20), slice(12, 16)),
+        (slice(20, 24), slice(20, 24)),
     ]
 
     local_descs, remote_descs = (

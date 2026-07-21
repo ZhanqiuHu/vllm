@@ -103,11 +103,11 @@ def _jointly_contiguous_subviews(
 def jointly_contiguous_chunks(
     local_view: torch.Tensor,
     remote_view: torch.Tensor,
-) -> Iterator[tuple[int, int, int]]:
-    """Yield byte ranges that are contiguous in both logical views.
+) -> Iterator[tuple[slice, slice]]:
+    """Yield paired byte slices contiguous in both logical views.
 
-    The block dimension is excluded. Returned offsets are relative to block zero
-    and include each view's storage offset.
+    The block dimension is excluded. Slice bounds are relative to block zero and
+    include each view's storage offset.
     """
     assert local_view.shape[1:] == remote_view.shape[1:]
     assert local_view.element_size() == remote_view.element_size()
@@ -116,21 +116,25 @@ def jointly_contiguous_chunks(
     local_block = local_view.select(_DIM4_B, 0)
     remote_block = remote_view.select(_DIM4_B, 0)
 
-    pending: tuple[int, int, int] | None = None
+    pending: tuple[slice, slice] | None = None
     for local_part, remote_part in _jointly_contiguous_subviews(
         local_block, remote_block
     ):
+        length = local_part.numel() * elem
+        local_start = local_part.storage_offset() * elem
+        remote_start = remote_part.storage_offset() * elem
         current = (
-            local_part.storage_offset() * elem,
-            remote_part.storage_offset() * elem,
-            local_part.numel() * elem,
+            slice(local_start, local_start + length),
+            slice(remote_start, remote_start + length),
         )
         if pending is None:
             pending = current
             continue
-        local_start, remote_start, length = pending
-        if current[0] == local_start + length and current[1] == remote_start + length:
-            pending = (local_start, remote_start, length + current[2])
+        if current[0].start == pending[0].stop and current[1].start == pending[1].stop:
+            pending = (
+                slice(pending[0].start, current[0].stop),
+                slice(pending[1].start, current[1].stop),
+            )
         else:
             yield pending
             pending = current
@@ -273,14 +277,19 @@ class NixlBaseConnectorWorkerMultiview(NixlBaseConnectorWorker):
         remote_parts: list[np.ndarray] = []
         for chunk_idx in range(num_chunks):
             chunk_group = [chunks[chunk_idx] for chunks in chunks_per_subblock]
-            remote_offset = chunk_group[0][1]
-            length = chunk_group[0][2]
+            remote_slice = chunk_group[0][1]
+            remote_offset = remote_slice.start
+            remote_stop = remote_slice.stop
+            assert isinstance(remote_offset, int)
+            assert isinstance(remote_stop, int)
+            length = remote_stop - remote_offset
+            assert all(chunk[1] == remote_slice for chunk in chunk_group)
+            local_slices = [chunk[0] for chunk in chunk_group]
             assert all(
-                chunk[1] == remote_offset and chunk[2] == length
-                for chunk in chunk_group
+                isinstance(local_slice.start, int) for local_slice in local_slices
             )
             subblock_offsets = np.asarray(
-                [chunk[0] for chunk in chunk_group], dtype=np.uint64
+                [local_slice.start for local_slice in local_slices], dtype=np.uint64
             )
             local_addrs = (
                 local_base_addr
