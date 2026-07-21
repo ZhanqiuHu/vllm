@@ -1290,7 +1290,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         input_is_sequence_parallel = (
             self.use_sequence_parallel_moe
             and residual is not None
-            and hidden_states.shape[0] != full_num_tokens
+            and (hidden_states.shape[0] != full_num_tokens
+                 or full_num_tokens < get_tensor_model_parallel_world_size())
         )
 
         # Self Attention
@@ -1329,7 +1330,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # pad if not divisible by world size
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
-            if not input_is_sequence_parallel:
+            if residual.shape[0] != hidden_states.shape[0]:
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
