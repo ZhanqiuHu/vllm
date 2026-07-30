@@ -272,11 +272,13 @@ from vllm.v1.attention.backends.mla.prefill import (
 )
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
+    get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.triton_merge_attn_states import mask_empty_context
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -374,6 +376,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         use_sparse: bool = False,
         indexer: object | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        non_causal_multi_token_decode: bool = False,
         **extra_impl_args,
     ):
         super().__init__()
@@ -390,6 +393,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
+        self.non_causal_multi_token_decode = non_causal_multi_token_decode
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
@@ -514,29 +518,36 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
         self.prefill_backend: MLAPrefillBackend | None
-        try:
-            prefill_backend_cls = get_mla_prefill_backend(vllm_config)
-        except ValueError:
-            if (
-                not self.impl.is_sparse
-                or vllm_config.attention_config.mla_prefill_backend is not None
-            ):
-                raise
+        if self.impl.is_sparse and not self.impl.supports_dense_mha_prefill:
             logger.warning_once(
-                "No MLA prefill backend supports this model; sparse MLA will use the "
-                "top-k MQA path only (no dense-MHA prefill)."
+                "Sparse MLA impl has no dense-MHA prefill path; using the top-k "
+                "MQA path only."
             )
             self.prefill_backend = None
         else:
-            self.prefill_backend = prefill_backend_cls(
-                num_heads=self.num_heads,
-                scale=self.scale,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                v_head_dim=self.v_head_dim,
-                vllm_config=vllm_config,
-            )
+            try:
+                prefill_backend_cls = get_mla_prefill_backend(vllm_config)
+            except ValueError:
+                if (
+                    not self.impl.is_sparse
+                    or vllm_config.attention_config.mla_prefill_backend is not None
+                ):
+                    raise
+                logger.warning_once(
+                    "No MLA prefill backend supports this model; sparse MLA will "
+                    "use the top-k MQA path only (no dense-MHA prefill)."
+                )
+                self.prefill_backend = None
+            else:
+                self.prefill_backend = prefill_backend_cls(
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    vllm_config=vllm_config,
+                )
 
         self.kv_cache = torch.tensor([])
 
@@ -761,13 +772,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         num_mha_tokens = q.size(0) - num_mqa_tokens
 
         if self.impl.is_sparse and num_mha_tokens > 0:
-            prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
-            use_mha = (
-                self.prefill_backend is not None
-                and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
-                and not self._vllm_config.attention_config.sparse_mla_force_mqa
-            )
-            if not use_mha:
+            prefill_metadata = getattr(attn_metadata, "prefill", None)
+            if not getattr(prefill_metadata, "use_dense_mha", False):
                 num_mqa_tokens = q.size(0)
                 num_mha_tokens = 0
 
@@ -1120,6 +1126,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -1383,6 +1390,7 @@ class MLACommonPrefillMetadata:
         workspace: torch.Tensor
         token_to_seq: torch.Tensor
         chunk_total_token: list[int]
+        has_empty_context: list[bool]
 
         # for mla DCP
         padded_local_chunk_seq_lens: list[list[int]] | None = None
@@ -1400,6 +1408,10 @@ class MLACommonPrefillMetadata:
     q_data_type: torch.dtype | None = None
     output_dtype: torch.dtype | None = None
     prefill_backend: MLAPrefillBackend | None = None
+    # Whether the prefill suffix is routed through dense MHA.
+    # Indexer scoring may be skipped only for a pure-prefill batch,
+    # since decode tokens still consume top-k indices.
+    use_dense_mha: bool = False
 
 
 @dataclass
@@ -1441,6 +1453,8 @@ class MLACommonMetadata(AttentionMetadata, Generic[D]):
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int
+
+    causal: bool = True
 
     # The dimension of the attention heads
     head_dim: int | None = None
@@ -1592,6 +1606,7 @@ def build_mla_chunked_context_metadata(
     )
     chunk_seq_lens = chunk_ends - chunk_starts
     chunk_seq_lens.clamp_(min=0)
+    has_empty_context = torch.any(chunk_seq_lens == 0, dim=1).tolist()
 
     cu_seq_lens_cpu = torch.zeros(
         num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
@@ -1670,6 +1685,7 @@ def build_mla_chunked_context_metadata(
             token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
             chunk_total_token=chunk_total_token.tolist(),
             workspace=chunked_prefill_workspace,
+            has_empty_context=has_empty_context,
             prefill_tokens_with_context=prefill_tokens_with_context,
             padded_local_chunk_seq_lens=padded_local_chunk_seq_lens.tolist(),
             local_context_lens_allranks=local_context_lens_allranks.tolist(),
@@ -1692,6 +1708,7 @@ def build_mla_chunked_context_metadata(
             token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
             chunk_total_token=chunk_total_token,
             workspace=chunked_prefill_workspace,
+            has_empty_context=has_empty_context,
             prefill_tokens_with_context=prefill_tokens_with_context,
         )
 
@@ -1712,6 +1729,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # If set to UNIFORM or VARLEN, this will increase `reorder_batch_threshold` when
     # speculative decoding is enabled.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
+
+    # Whether this builder can flatten a non-causal query block into decode rows.
+    supports_non_causal_multi_token_decode: ClassVar[bool] = False
 
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
@@ -1813,8 +1833,14 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.vllm_config = vllm_config
         self.device = device
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.non_causal_multi_token_decode = getattr(
+            kv_cache_spec, "non_causal_multi_token_decode", False
+        )
 
-        self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
+        # A draft cache group can have a different head count from the target.
+        self.num_heads = get_num_attention_heads_from_layers(
+            vllm_config, layer_names
+        ) or self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.aot_schedule = current_platform.is_cuda()
 
@@ -1940,14 +1966,42 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold,
-                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
-                treat_short_extends_as_decodes=not self.use_pcp,
+        non_causal_decode = common_attn_metadata.causal is False
+        if non_causal_decode:
+            if not (
+                self.supports_non_causal_multi_token_decode
+                and self.non_causal_multi_token_decode
+            ):
+                raise ValueError(
+                    "Non-causal multi-token MLA requires an explicitly supported "
+                    "attention group."
+                )
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            num_active_reqs = int(torch.count_nonzero(query_lens > 0))
+            uniform_active_queries = num_active_reqs > 0 and bool(
+                torch.all(query_lens[:num_active_reqs] == query_lens[0])
             )
-        )
+            trailing_graph_padding = bool(torch.all(query_lens[num_active_reqs:] == 0))
+            if not (uniform_active_queries and trailing_graph_padding):
+                raise ValueError(
+                    "Non-causal MLA requires a uniform query block; got query "
+                    f"lengths {query_lens.tolist()}."
+                )
+            # Use exact GPU sequence lengths instead of the prefill path's CPU
+            # context-length upper bounds.
+            num_decodes = num_reqs
+            num_prefills = 0
+            num_decode_tokens = num_tokens
+            num_prefill_tokens = 0
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold,
+                    require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+                    treat_short_extends_as_decodes=not self.use_pcp,
+                )
+            )
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
@@ -2038,6 +2092,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
+            causal=not non_causal_decode,
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
@@ -2279,6 +2334,13 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     v=v,
                 )
             )
+            if prefill_metadata.chunked_context.has_empty_context[i]:
+                mask_empty_context(
+                    attn_softmax_lse,
+                    attn_output,
+                    prefill_metadata.query_start_loc,
+                    prefill_metadata.chunked_context.cu_seq_lens[i],
+                )
 
             if output is None:
                 output = attn_output
@@ -2429,6 +2491,13 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     v=v,
                 )
             )
+            if prefill_metadata.chunked_context.has_empty_context[i]:
+                mask_empty_context(
+                    attn_softmax_lse,
+                    attn_output,
+                    prefill_metadata.query_start_loc,
+                    prefill_metadata.chunked_context.cu_seq_lens[i],
+                )
 
             if output is None:
                 output = attn_output
