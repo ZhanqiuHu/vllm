@@ -144,6 +144,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             decode_query_len=1,
         )
 
+    def get_cudagraph_managers(self) -> list:
+        mgrs = []
+        if self.prefill_cudagraph_manager is not None:
+            mgrs.append(self.prefill_cudagraph_manager)
+        if self.decode_cudagraph_manager is not None:
+            mgrs.append(self.decode_cudagraph_manager)
+        return mgrs
+
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
         # Reset indices to zeros to prevent stale values from prior

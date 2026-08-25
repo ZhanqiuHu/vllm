@@ -137,6 +137,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             decode_query_len=self.num_query_per_req,
         )
 
+    def get_cudagraph_managers(self) -> list:
+        if self.query_cudagraph_manager is not None:
+            return [self.query_cudagraph_manager]
+        return []
+
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Padded sample rows must not scatter into a live request during capture.

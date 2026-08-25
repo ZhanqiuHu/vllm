@@ -38,6 +38,15 @@ class BaseSpeculator(ABC):
     def capture(self) -> None:
         pass
 
+    def get_cudagraph_managers(self) -> list:
+        """Return all CudaGraphManager instances owned by this speculator.
+
+        Used by ``profile_cudagraph_memory`` to redirect profiling captures
+        into a throwaway pool so the persistent global pool is not polluted.
+        Subclasses that create their own CudaGraphManager(s) must override.
+        """
+        return []
+
     @abstractmethod
     def propose(
         self,
