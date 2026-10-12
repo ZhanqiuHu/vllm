@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import layer_mapping
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -74,6 +75,7 @@ class NixlAgentMetadata:
     pcp_size: int = 1
     # Layer names sharing each advertised region, in region order.
     region_members: list[list[str]] = field(default_factory=list)
+    layer_geometry: dict[str, layer_mapping.LayerGeometry] = field(default_factory=dict)
 
 
 @dataclass
@@ -195,7 +197,11 @@ def compute_nixl_compatibility_hash(
         "transfer_mode": transfer_mode,
     }
 
+    if layer_mapping.enabled(vllm_config):
+        factors["experimental_layer_mapping"] = 1
     compat_hash = hash_factors(factors)
+    if layer_mapping.enabled(vllm_config):
+        logger.info("NIXL_MAP_COMPAT hash=%s factors=%s", compat_hash, factors)
     logger.debug(
         "NIXL compatibility hash: %s (model=%s, dtype=%s, num_kv_heads=%d, "
         "cache_dtype=%s, attn_backend=%s)",

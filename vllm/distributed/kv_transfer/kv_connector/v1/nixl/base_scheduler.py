@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import layer_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     HeartbeatInfo,
@@ -282,7 +283,8 @@ class NixlBaseConnectorScheduler:
         clipped = []
         for i, blocks in enumerate(block_ids):
             if n_sw := self.blocks_per_sw[i]:
-                blocks = blocks[-n_sw:]
+                if not layer_mapping.enabled(self.vllm_config):
+                    blocks = blocks[-n_sw:]
             elif (
                 clip_ssm
                 and blocks

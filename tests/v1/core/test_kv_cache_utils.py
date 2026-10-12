@@ -3209,7 +3209,7 @@ def test_hybrid_group_size_selection(
 
 
 @pytest.mark.parametrize("kv_connector", [False, True])
-def test_kv_transfer_group_planning_is_tp_invariant(kv_connector):
+def test_kv_transfer_group_planning_keeps_byte_costs(kv_connector):
     # 13 target + 4 drafter full attention layers. At TP8 the target's 8 KV
     # heads shard to 1 while the drafter's 2 are replicated to 1, which changes
     # their relative bytes and, with byte-based planning, the group size.
@@ -3227,17 +3227,17 @@ def test_kv_transfer_group_planning_is_tp_invariant(kv_connector):
         config = _grouping_config()
         config.kv_transfer_config = object() if kv_connector else None
         groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
-            kv_cache_utils.unify_kv_cache_spec_page_size(specs), config, specs
+            kv_cache_utils.unify_kv_cache_spec_page_size(specs), config
         )
         return max(len(group.layer_names) for group in groups)
 
-    assert (group_size(8, 2) == group_size(1, 1)) == kv_connector
+    assert group_size(8, 2) != group_size(1, 1)
 
 
 @pytest.mark.parametrize("kv_connector", [False, True])
-def test_equal_page_size_sharing_disabled_with_kv_connector(kv_connector):
+def test_equal_page_size_sharing_preserved_with_kv_connector(kv_connector):
     # Target 4x256 and drafter 8x128 full attention have equal page bytes at
-    # TP1 but not at TP8, so with a KV connector they must not share a bucket.
+    # TP1 but not at TP8. A connector must not disable equal-page sharing.
     full = FullAttentionSpec(
         block_size=16, num_kv_heads=4, head_size=256, dtype=torch.bfloat16
     )
@@ -3249,7 +3249,7 @@ def test_equal_page_size_sharing_disabled_with_kv_connector(kv_connector):
     shared = any(
         "draft" in group.layer_names and len(group.layer_names) > 1 for group in groups
     )
-    assert shared is not kv_connector
+    assert shared
 
 
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
