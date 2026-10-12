@@ -38,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import layer_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     NixlAgentMetadata,
@@ -1060,6 +1061,12 @@ class NixlBaseConnectorWorker:
 
                 # Check compatibility hash BEFORE decoding agent metadata
                 assert self.compat_hash is not None
+                if layer_mapping.enabled(self.vllm_config):
+                    logger.info(
+                        "NIXL_MAP_HASH rank=%s local=%s remote=%s enforced=%s",
+                        self.tp_rank, self.compat_hash,
+                        handshake_payload.compatibility_hash, self.enforce_compat_hash,
+                    )
                 if (
                     self.enforce_compat_hash
                     and handshake_payload.compatibility_hash != self.compat_hash
@@ -1398,6 +1405,21 @@ class NixlBaseConnectorWorker:
             self.kv_buffer_device,
             self.use_host_buffer,
         )
+
+        if layer_mapping.enabled(self.vllm_config):
+            layer_mapping.register(self, xfer_buffers)
+            logger.info(
+                "Experimental layer mapping: %d layers, %d groups",
+                len(self._layer_mapping_local),
+                len({g.group for g in self._layer_mapping_local.values()}),
+            )
+            for group_id, group in enumerate(self.kv_cache_config.transfer_groups):
+                logger.info(
+                    "Experimental layer mapping group %d: %s",
+                    group_id,
+                    group.layer_names,
+                )
+            return
 
         registration_ranges: dict[tuple[int, str], tuple[int, int, int]] = {}
         region_mem_types: list[str] = []
@@ -2175,6 +2197,11 @@ class NixlBaseConnectorWorker:
                 remote_tp_rank,
             )
             return self._remote_agents[engine_id][(0, remote_tp_rank)]
+
+        if layer_mapping.enabled(self.vllm_config):
+            return layer_mapping.add_remote(
+                self, nixl_agent_meta, remote_tp_rank, remote_tp_size, remote_dcp_size
+            )
 
         assert self.transfer_topo is not None
         transfer_topo = self.transfer_topo
@@ -3031,6 +3058,11 @@ class NixlBaseConnectorWorker:
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
+                        if layer_mapping.enabled(self.vllm_config):
+                            logger.info(
+                                "NIXL_MAP_DONE req=%s rank=%s handle=%s state=%s",
+                                req_id, self.tp_rank, handle, xfer_state,
+                            )
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self.nixl_wrapper.release_xfer_handle(handle)
@@ -3549,6 +3581,11 @@ class NixlBaseConnectorWorker:
         self.dst_uses_region_group_mapping.pop(engine_id, None)
         self.dst_region_mem_types.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
+        if hasattr(self, "_layer_mapping_remote"):
+            for key in list(self._layer_mapping_remote):
+                if key[0] == engine_id:
+                    del self._layer_mapping_remote[key]
+                    self._layer_mapping_traced.discard(key)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 

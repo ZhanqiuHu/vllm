@@ -1439,8 +1439,8 @@ _TARGET_SW = {
         ({"a": _attn_spec(2), "b": _attn_spec(2)}, None, False),
         # Manager block would have to be split into kernel blocks.
         (_DRAFTER_FULL, (128,), False),
-        # No full attention padding and fewer groups without packing (MiMo-like).
-        (_TARGET_SW, None, False),
+        # Updated minimum-size search gives 17 uniform groups vs 11 packed.
+        (_TARGET_SW, None, True),
     ],
 )
 def test_prefers_packed_kv_cache(specs, kernel_block_sizes, expected):
@@ -1449,3 +1449,20 @@ def test_prefers_packed_kv_cache(specs, kernel_block_sizes, expected):
     )
     backends = [_backend(*(kernel_block_sizes or (MultipleOf(16),)))]
     assert WorkerBase._prefers_packed_kv_cache(worker, backends) is expected
+
+
+def test_packed_preference_tracks_updated_group_size_search():
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_groups_uniform_page_size,
+        _plan_packed_kv_cache_groups,
+        unify_kv_cache_spec_page_size,
+    )
+
+    config = _grouping_vllm_config()
+    uniform = _get_kv_cache_groups_uniform_page_size(
+        unify_kv_cache_spec_page_size(_TARGET_SW), config, warn_padding=False
+    )
+    packed = _plan_packed_kv_cache_groups(config, _TARGET_SW)
+    assert len(uniform) == 17
+    assert max(len(group.layer_names) for group in uniform) == 3
+    assert packed is not None and len(packed) == 11

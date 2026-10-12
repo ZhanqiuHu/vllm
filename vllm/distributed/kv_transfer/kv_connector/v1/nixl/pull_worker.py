@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl import layer_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
@@ -169,6 +170,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # then takes the notify-only path without registering a transfer.
             # Seed the entry so this rank still reports completion.
             self._recving_transfers.setdefault(req_id, [])
+
+        if layer_mapping.enabled(self.vllm_config):
+            layer_mapping.read(self, req_id, meta)
+            return
 
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
