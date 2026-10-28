@@ -2364,18 +2364,6 @@ class NixlBaseConnectorWorker:
         remote_logical_blocks = nixl_agent_meta.num_blocks // (
             transfer_info.remote_physical_blocks_per_logical
         )
-        for entry, region_routes in routes:
-            spec_type = type(self._layer_specs[entry.layer_name])
-            is_ssm = _is_ssm_spec(spec_type)
-            layer_types.append(is_ssm)
-            if is_ssm:
-                ssm_routes.extend(region_routes)
-            elif _is_attention_spec(spec_type):
-                fa_routes.extend(region_routes)
-            else:
-                raise ValueError(
-                    f"Unsupported layer spec for layer-routed transfer: {spec_type}"
-                )
 
         parts: list[np.ndarray] = []
         if fa_routes:
