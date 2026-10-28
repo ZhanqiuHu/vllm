@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -109,27 +109,9 @@ class LayerRoute:
 
     local_group_id: int
     remote_group_id: int
-    region_routes: tuple[tuple[int, int], ...]
+    local_region_indices: tuple[int, ...]
+    remote_region_indices: tuple[int, ...]
     is_ssm: bool
-
-
-@dataclass(frozen=True)
-class LayerDescriptorLayout:
-    """Descriptor layout for one layer in a layer-routed transfer."""
-
-    local_offset: int
-    remote_offset: int
-    local_count: int
-    remote_count: int
-
-
-@dataclass(frozen=True)
-class LayerRouteSelection:
-    """Classified layer routes for layer-routed transfers."""
-
-    routes: tuple[LayerRoute, ...]
-    segment_count: int
-    layouts: tuple[LayerDescriptorLayout, ...] = ()
 
 
 def _kv_group_membership(layer_group_ids: dict[str, int]) -> frozenset[frozenset[str]]:
@@ -1391,8 +1373,7 @@ class NixlBaseConnectorWorker:
         self._layer_region_indices: dict[str, list[int]] = {
             layer_name: [] for layer_name in self._layer_group_ids
         }
-        self._layer_route_selections: dict[EngineId, LayerRouteSelection] = {}
-        self._layer_routed_src_handles: dict[EngineId, tuple[int, ...]] = {}
+        self._layer_routes: dict[EngineId, tuple[LayerRoute, ...]] = {}
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.transfer_tp_rank,
@@ -1861,9 +1842,7 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
-    def _build_mamba_local(
-        self, base_addresses: list[int], region_indices: list[int] | None = None
-    ) -> np.ndarray:
+    def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
         """Build desc regions (conv sub-projections + ssm) per layer for
         local mamba blocks with DS conv layout, as an Nx3 uint64 array.
 
@@ -1906,12 +1885,7 @@ class NixlBaseConnectorWorker:
         block_arange = np.arange(num_blocks, dtype=np.uint64)
         parts: list[np.ndarray] = []
 
-        selected_region_indices = (
-            region_indices
-            if region_indices is not None
-            else (self._ssm_region_indices or range(len(base_addresses)))
-        )
-        for i in selected_region_indices:
+        for i in self._ssm_region_indices or range(len(base_addresses)):
             base_addr = base_addresses[i]
             block_stride = self.block_stride_per_layer[i] * physical_per_logical
             blk_addrs = base_addr + block_arange * block_stride
@@ -2025,16 +1999,13 @@ class NixlBaseConnectorWorker:
         self,
         base_addresses: list[int],
         block_size_ratio: int,
-        region_indices: list[int] | None = None,
     ) -> np.ndarray:
         """Build local FA descriptors as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
         assert base_addresses, "Local KV cache base addresses must not be empty."
         device_id = self.device_id
-        selected_region_indices = (
-            region_indices
-            if region_indices is not None
-            else (self._transfer_layer_region_indices or range(len(base_addresses)))
+        selected_region_indices = self._transfer_layer_region_indices or range(
+            len(base_addresses)
         )
         parts: list[np.ndarray] = []
         for i in selected_region_indices:
@@ -2203,130 +2174,16 @@ class NixlBaseConnectorWorker:
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
-    def _layer_routes_by_type(
-        self, selection: LayerRouteSelection, is_ssm: bool
+    def _layer_region_routes(
+        self, routes: tuple[LayerRoute, ...], is_ssm: bool
     ) -> tuple[tuple[int, int], ...]:
         return tuple(
-            region_route
-            for route in selection.routes
+            (local_region, remote_region)
+            for route in routes
             if route.is_ssm == is_ssm
-            for region_route in route.region_routes
-        )
-
-    def _build_layer_descriptor_layouts(
-        self,
-        selection: LayerRouteSelection,
-        remote_region_num_blocks: Sequence[int],
-        remote_logical_blocks: int,
-        block_size_ratio: int,
-    ) -> tuple[LayerDescriptorLayout, ...]:
-        fa_routes = self._layer_routes_by_type(selection, is_ssm=False)
-        local_fa_offset = 0
-        local_ssm_offset = sum(
-            self.region_num_blocks[local_region] * block_size_ratio
-            for local_region, _ in fa_routes
-        )
-        remote_fa_offset = 0
-        remote_ssm_offset = sum(
-            remote_region_num_blocks[remote_region] for _, remote_region in fa_routes
-        )
-
-        layouts: list[LayerDescriptorLayout] = []
-        for route in selection.routes:
-            region_routes = route.region_routes
-            if route.is_ssm:
-                local_count = (
-                    self._logical_num_blocks
-                    * selection.segment_count
-                    * len(region_routes)
-                )
-                remote_count = (
-                    remote_logical_blocks * selection.segment_count * len(region_routes)
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        local_offset=local_ssm_offset,
-                        remote_offset=remote_ssm_offset,
-                        local_count=local_count,
-                        remote_count=remote_count,
-                    )
-                )
-                local_ssm_offset += local_count
-                remote_ssm_offset += remote_count
-            else:
-                local_count = sum(
-                    self.region_num_blocks[local_region] * block_size_ratio
-                    for local_region, _ in region_routes
-                )
-                remote_count = sum(
-                    remote_region_num_blocks[remote_region]
-                    for _, remote_region in region_routes
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        local_offset=local_fa_offset,
-                        remote_offset=remote_fa_offset,
-                        local_count=local_count,
-                        remote_count=remote_count,
-                    )
-                )
-                local_fa_offset += local_count
-                remote_fa_offset += remote_count
-        return tuple(layouts)
-
-    def _build_layer_routed_blocks(
-        self,
-        selection: LayerRouteSelection,
-        plan: TPMapping,
-        nixl_agent_meta: NixlAgentMetadata,
-        transfer_info: EngineTransferInfo,
-        block_size_ratio: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        assert self.transfer_topo is not None
-        fa_routes = self._layer_routes_by_type(selection, is_ssm=False)
-        ssm_routes = self._layer_routes_by_type(selection, is_ssm=True)
-
-        local_parts: list[np.ndarray] = []
-        remote_parts: list[np.ndarray] = []
-        if fa_routes:
-            local_parts.append(
-                self._build_fa_local(
-                    self.kv_caches_base_addr[self.engine_id][self.tp_rank],
-                    block_size_ratio,
-                    [local_region for local_region, _ in fa_routes],
-                )
+            for local_region, remote_region in zip(
+                route.local_region_indices, route.remote_region_indices
             )
-            remote_parts.append(
-                self._build_fa_remote(
-                    plan,
-                    nixl_agent_meta,
-                    block_size_ratio,
-                    fa_routes,
-                )
-            )
-        if ssm_routes:
-            tp_ratio = self.transfer_topo.tp_ratio(transfer_info.remote_tp_size)
-            local_parts.append(
-                self._build_mamba_local(
-                    self.kv_caches_base_addr[self.engine_id][self.tp_rank],
-                    [local_region for local_region, _ in ssm_routes],
-                )
-            )
-            remote_parts.append(
-                self._build_mamba_remote(
-                    nixl_agent_meta,
-                    tp_ratio,
-                    transfer_info,
-                    ssm_routes,
-                )
-            )
-        return (
-            np.concatenate(local_parts)
-            if local_parts
-            else np.empty((0, 3), dtype=np.uint64),
-            np.concatenate(remote_parts)
-            if remote_parts
-            else np.empty((0, 3), dtype=np.uint64),
         )
 
     def _is_heterogeneous_kv_grouping(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
@@ -2349,7 +2206,7 @@ class NixlBaseConnectorWorker:
 
     def _prepare_layer_routes(
         self, nixl_agent_meta: NixlAgentMetadata
-    ) -> LayerRouteSelection:
+    ) -> tuple[LayerRoute, ...]:
         """Build the pull routing selection in local model-layer order."""
         local_layout = (
             self.host_buffer_kv_cache_layout
@@ -2358,9 +2215,8 @@ class NixlBaseConnectorWorker:
         )
         if local_layout != "LBHNC" or nixl_agent_meta.kv_cache_layout != "LBHNC":
             raise RuntimeError(
-                "Heterogeneous KV grouping requires layer-first LBHNC on both "
-                f"engines: local={local_layout}, "
-                f"remote={nixl_agent_meta.kv_cache_layout}"
+                "Heterogeneous KV grouping requires layer-first LBHNC on both engines: "
+                f"local={local_layout}, remote={nixl_agent_meta.kv_cache_layout}"
             )
 
         remote_region_count = len(nixl_agent_meta.kv_caches_base_addr)
@@ -2370,26 +2226,18 @@ class NixlBaseConnectorWorker:
             remote_region_indices = tuple(
                 nixl_agent_meta.layer_region_indices.get(layer_name, ())
             )
-            if not local_region_indices or not remote_region_indices:
-                raise ValueError(
-                    f"Layer {layer_name!r} is missing NIXL region membership: "
-                    f"local={local_region_indices}, "
-                    f"remote={remote_region_indices}"
-                )
-            if any(index >= self.num_regions for index in local_region_indices):
-                raise ValueError(
-                    f"Layer {layer_name!r} has an invalid local region index: "
-                    f"{local_region_indices}, num_regions={self.num_regions}"
-                )
-            if any(index >= remote_region_count for index in remote_region_indices):
-                raise ValueError(
-                    f"Layer {layer_name!r} has an invalid remote region index: "
-                    f"{remote_region_indices}, "
-                    f"num_remote_regions={remote_region_count}"
-                )
-            region_routes = tuple(
-                zip(local_region_indices, remote_region_indices, strict=True)
+            invalid = (
+                not local_region_indices
+                or len(local_region_indices) != len(remote_region_indices)
+                or max(local_region_indices, default=-1) >= self.num_regions
+                or max(remote_region_indices, default=-1) >= remote_region_count
             )
+            if invalid:
+                raise ValueError(
+                    f"Invalid NIXL region membership for {layer_name!r}: "
+                    f"local={local_region_indices}/{self.num_regions}, "
+                    f"remote={remote_region_indices}/{remote_region_count}"
+                )
             spec_type = type(self._layer_specs[layer_name])
             is_ssm = _is_ssm_spec(spec_type)
             if not is_ssm and not _is_attention_spec(spec_type):
@@ -2400,173 +2248,78 @@ class NixlBaseConnectorWorker:
                 LayerRoute(
                     local_group_id=self._layer_group_ids[layer_name],
                     remote_group_id=nixl_agent_meta.layer_group_ids[layer_name],
-                    region_routes=region_routes,
+                    local_region_indices=local_region_indices,
+                    remote_region_indices=remote_region_indices,
                     is_ssm=is_ssm,
                 )
             )
 
-        if self._has_mamba:
-            assert self._conv_decomp is not None
-            segment_count = len(self._conv_decomp.local_conv_offsets) + 1
-        else:
-            segment_count = 1
-        selection = LayerRouteSelection(
-            routes=tuple(routes),
-            segment_count=segment_count,
-        )
-        existing = self._layer_route_selections.get(nixl_agent_meta.engine_id)
-        if existing is not None and existing.routes != selection.routes:
-            raise RuntimeError(
-                "Remote engine advertised inconsistent layer routing: "
-                f"engine={nixl_agent_meta.engine_id}"
-            )
-        self._layer_route_selections[nixl_agent_meta.engine_id] = selection
-        return selection
+        layer_routes = tuple(routes)
+        self._layer_routes[nixl_agent_meta.engine_id] = layer_routes
+        return layer_routes
 
-    def _prepare_remote_agent_common(
+    def _compute_layer_desc_ids(
         self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_size: int,
-        remote_dcp_size: int,
-    ) -> tuple[EngineTransferInfo, TPMapping, str, int, int]:
-        assert self.transfer_topo is not None
-        transfer_topo = self.transfer_topo
-        engine_id = nixl_agent_meta.engine_id
-        transfer_info = EngineTransferInfo(
-            remote_tp_size=remote_tp_size,
-            remote_block_size=nixl_agent_meta.block_size,
-            remote_block_len=nixl_agent_meta.block_lens[0],
-            remote_physical_blocks_per_logical=(
-                nixl_agent_meta.physical_blocks_per_logical_kv_block
-            ),
-            remote_dcp_size=remote_dcp_size,
-        )
-        transfer_topo.register_remote_engine(engine_id, transfer_info)
-
-        plan = compute_tp_mapping(
-            transfer_topology=transfer_topo,
-            remote_tp_size=remote_tp_size,
-            group_spec_types=self._group_spec_types,
-            remote_dcp_size=remote_dcp_size,
-        )
-        self.tp_mappings[engine_id] = plan
-        remote_agent_name = self.nixl_wrapper.add_remote_agent(
-            nixl_agent_meta.agent_metadata
-        )
-        block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
-        tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
-        return transfer_info, plan, remote_agent_name, block_size_ratio, tp_ratio
-
-    def _register_remote_region_metadata(
-        self,
-        engine_id: EngineId,
-        nixl_agent_meta: NixlAgentMetadata,
-        region_group_ids: list[int],
-    ) -> None:
-        num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
-        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-        self.dst_region_num_blocks[engine_id] = (
-            nixl_agent_meta.region_num_blocks
-            or [nixl_agent_meta.num_blocks] * num_remote_regions
-        )
-        self.dst_region_group_ids[engine_id] = region_group_ids
-        self.dst_uses_region_group_mapping[engine_id] = len(set(region_group_ids)) > 1
-        self.dst_region_mem_types[engine_id] = (
-            nixl_agent_meta.region_mem_types
-            or [self.nixl_memory_type] * num_remote_regions
-        )
-        if len(set(self.dst_region_mem_types[engine_id])) != 1:
-            raise NotImplementedError(
-                "NIXL pull does not yet support a mixed-memory producer"
-            )
-
-    def _add_layer_routed_remote_agent(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_rank: int,
-        transfer_info: EngineTransferInfo,
-        plan: TPMapping,
-        remote_agent_name: str,
+        dst_engine_id: EngineId,
+        routes: tuple[LayerRoute, ...],
+        block_ids: BlockIds,
+        remote: bool,
         block_size_ratio: int,
-        tp_ratio: int,
-    ) -> str:
-        assert self.transfer_topo is not None
-        engine_id = nixl_agent_meta.engine_id
-        selection = self._layer_route_selections[engine_id]
-        local_blocks, remote_blocks = self._build_layer_routed_blocks(
-            selection,
-            plan,
-            nixl_agent_meta,
-            transfer_info,
-            block_size_ratio,
+        remote_logical_blocks: int,
+    ) -> np.ndarray:
+        """Map per-layer block IDs into a layer-routed descriptor list."""
+        assert self._conv_decomp is not None or not any(
+            route.is_ssm for route in routes
         )
-        self._register_remote_region_metadata(
-            engine_id,
-            nixl_agent_meta,
-            nixl_agent_meta.region_group_ids
-            or [0] * len(nixl_agent_meta.kv_caches_base_addr),
+        segment_count = (
+            len(self._conv_decomp.local_conv_offsets) + 1 if self._conv_decomp else 1
         )
-        remote_logical_blocks = nixl_agent_meta.num_blocks // (
-            transfer_info.remote_physical_blocks_per_logical
+        region_counts = (
+            self.dst_region_num_blocks[dst_engine_id]
+            if remote
+            else [count * block_size_ratio for count in self.region_num_blocks]
         )
-        selection = replace(
-            selection,
-            layouts=self._build_layer_descriptor_layouts(
-                selection,
-                self.dst_region_num_blocks[engine_id],
-                remote_logical_blocks,
-                block_size_ratio,
-            ),
+        logical_blocks = remote_logical_blocks if remote else self._logical_num_blocks
+        selected = lambda route: (
+            route.remote_region_indices if remote else route.local_region_indices
         )
-        self._layer_route_selections[engine_id] = selection
-
-        if engine_id not in self._layer_routed_src_handles:
-            num_fa_descs = sum(
-                layout.local_count
-                for route, layout in zip(
-                    selection.routes, selection.layouts, strict=True
-                )
-                if not route.is_ssm
+        fa_regions = (
+            [r for route in routes if not route.is_ssm for r in selected(route)]
+            if remote
+            else range(self.num_regions)
+        )
+        ssm_regions = (
+            [r for route in routes if route.is_ssm for r in selected(route)]
+            if remote
+            else self._ssm_region_indices
+        )
+        fa_counts = [region_counts[r] for r in fa_regions]
+        ssm_counts = [segment_count * logical_blocks] * len(ssm_regions)
+        fa_offsets = dict(zip(fa_regions, np.cumsum([0, *fa_counts])[:-1]))
+        ssm_offsets = dict(
+            zip(
+                ssm_regions,
+                np.cumsum(
+                    [
+                        sum(fa_counts) if remote else self.num_descs * block_size_ratio,
+                        *ssm_counts,
+                    ]
+                )[:-1],
             )
-            if self._needs_split_local_xfer_handles(tp_ratio, plan):
-                split_blocks = self._build_local_splits_from_plan(
-                    plan,
-                    local_blocks,
-                    num_fa_descs,
-                    block_size_ratio,
-                )
-                handles = tuple(
-                    self.nixl_wrapper.prep_xfer_dlist(
-                        "NIXL_INIT_AGENT",
-                        self.nixl_wrapper.get_xfer_descs(
-                            handle_data, self.nixl_memory_type
-                        ),
+        )
+        desc_ids: list[int] = []
+        for route, layer_ids in zip(routes, block_ids, strict=True):
+            for region in selected(route):
+                base = ssm_offsets[region] if route.is_ssm else fa_offsets[region]
+                if route.is_ssm:
+                    desc_ids.extend(
+                        base + segment * logical_blocks + block_id
+                        for block_id in layer_ids
+                        for segment in range(segment_count)
                     )
-                    for handle_data in split_blocks
-                )
-            else:
-                handles = (
-                    self.nixl_wrapper.prep_xfer_dlist(
-                        "NIXL_INIT_AGENT",
-                        self.nixl_wrapper.get_xfer_descs(
-                            local_blocks, self.nixl_memory_type
-                        ),
-                    ),
-                )
-            self._layer_routed_src_handles[engine_id] = handles
-
-        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
-            self.nixl_wrapper.prep_xfer_dlist(
-                remote_agent_name,
-                self.nixl_wrapper.get_xfer_descs(
-                    remote_blocks, self.dst_region_mem_types[engine_id][0]
-                ),
-            )
-        )
-        self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
-            nixl_agent_meta.kv_caches_base_addr
-        )
-        return remote_agent_name
+                else:
+                    desc_ids.extend(base + block_id for block_id in layer_ids)
+        return np.asarray(desc_ids, dtype=np.int64)
 
     def add_remote_agent(
         self,
@@ -2630,25 +2383,18 @@ class NixlBaseConnectorWorker:
 
         assert self.transfer_topo is not None
         transfer_topo = self.transfer_topo
+        layer_routes = None
         if self._is_heterogeneous_kv_grouping(nixl_agent_meta):
             if self._TRANSFER_MODE != "pull":
                 raise NotImplementedError(
                     "Heterogeneous KV grouping is only planned for NIXL pull mode"
                 )
             routing_plan = self._prepare_layer_routes(nixl_agent_meta)
+            layer_routes = routing_plan
             logger.info(
                 "Detected heterogeneous KV grouping for engine %s: %d routed layers",
                 engine_id,
-                len(routing_plan.routes),
-            )
-            return self._add_layer_routed_remote_agent(
-                nixl_agent_meta,
-                remote_tp_rank,
-                *self._prepare_remote_agent_common(
-                    nixl_agent_meta,
-                    remote_tp_size,
-                    remote_dcp_size,
-                ),
+                len(routing_plan),
             )
         # Number of physical regions registered locally (one per layer/tensor).
         num_local_regions = len(self.block_len_per_layer)
@@ -2693,18 +2439,31 @@ class NixlBaseConnectorWorker:
                     start:end
                 ]
 
-        (
-            transfer_info,
-            plan,
-            remote_agent_name,
-            block_size_ratio,
-            tp_ratio,
-        ) = self._prepare_remote_agent_common(
-            nixl_agent_meta,
-            remote_tp_size,
-            remote_dcp_size,
+        ### Register remote engine in TransferTopology (idempotent).
+        physical_blocks_per_logical = (
+            nixl_agent_meta.physical_blocks_per_logical_kv_block
         )
+        transfer_info = EngineTransferInfo(
+            remote_tp_size=remote_tp_size,
+            remote_block_size=nixl_agent_meta.block_size,
+            remote_block_len=nixl_agent_meta.block_lens[0],
+            remote_physical_blocks_per_logical=physical_blocks_per_logical,
+            remote_dcp_size=remote_dcp_size,
+        )
+        transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
+
+        plan = compute_tp_mapping(
+            transfer_topology=transfer_topo,
+            remote_tp_size=remote_tp_size,
+            group_spec_types=self._group_spec_types,
+            remote_dcp_size=remote_dcp_size,
+        )
+        self.tp_mappings[engine_id] = plan
+
+        remote_agent_name = self.nixl_wrapper.add_remote_agent(
+            nixl_agent_meta.agent_metadata
+        )
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
         # so we only register once per engine_id.
@@ -2715,24 +2474,38 @@ class NixlBaseConnectorWorker:
         # local mapped:| 0| 1| 2| 3| 4| 5| 6| 7| 8| 9|10|11|12|13|14|15|
         if engine_id not in self.dst_num_blocks:
             num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
+            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+            self.dst_region_num_blocks[engine_id] = (
+                nixl_agent_meta.region_num_blocks
+                or [nixl_agent_meta.num_blocks] * num_remote_regions
+            )
             remote_region_group_ids = nixl_agent_meta.region_group_ids or (
                 self.region_group_ids
                 if len(self.region_group_ids) == num_remote_regions
                 else [0] * num_remote_regions
             )
-            self._register_remote_region_metadata(
-                engine_id,
-                nixl_agent_meta,
-                remote_region_group_ids,
+            self.dst_region_group_ids[engine_id] = remote_region_group_ids
+            self.dst_uses_region_group_mapping[engine_id] = (
+                len(set(self.dst_region_group_ids[engine_id])) > 1
+            )
+            self.dst_region_mem_types[engine_id] = (
+                nixl_agent_meta.region_mem_types
+                or [self.nixl_memory_type] * num_remote_regions
             )
 
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
         )
-        self._validate_remote_agent_handshake(
-            nixl_agent_meta, remote_tp_size, remote_dcp_size
-        )
+        if layer_routes is None:
+            self._validate_remote_agent_handshake(
+                nixl_agent_meta, remote_tp_size, remote_dcp_size
+            )
+
+        # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
+        # this is the ratio between the two sizes.
+        tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
+        block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
 
         logger.debug(
             "Registering remote agent (%s, rank %s) memory regions with tp_ratio %s",
@@ -2802,6 +2575,7 @@ class NixlBaseConnectorWorker:
             plan,
             nixl_agent_meta,
             block_size_ratio,
+            self._layer_region_routes(layer_routes, False) if layer_routes else None,
         )
         logger.debug(
             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
@@ -2816,7 +2590,12 @@ class NixlBaseConnectorWorker:
                 engine_id,
                 remote_tp_rank,
             )
-            mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
+            mamba = self._build_mamba_remote(
+                nixl_agent_meta,
+                tp_ratio,
+                transfer_info,
+                self._layer_region_routes(layer_routes, True) if layer_routes else None,
+            )
             blocks_data = np.concatenate([blocks_data, mamba])
 
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
@@ -3992,9 +3771,7 @@ class NixlBaseConnectorWorker:
         self.dst_uses_region_group_mapping.pop(engine_id, None)
         self.dst_region_mem_types.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
-        self._layer_route_selections.pop(engine_id, None)
-        for handle in self._layer_routed_src_handles.pop(engine_id, ()):
-            self.nixl_wrapper.release_dlist_handle(handle)
+        self._layer_routes.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 

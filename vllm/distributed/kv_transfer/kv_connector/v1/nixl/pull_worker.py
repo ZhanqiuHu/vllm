@@ -9,7 +9,7 @@ import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
-    LayerRouteSelection,
+    LayerRoute,
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -144,15 +144,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _align_layer_block_ids(
         self,
+        route: LayerRoute,
         local_ids: list[int],
         remote_ids: list[int],
-        is_ssm: bool,
         block_size_ratio: int,
         remote_physical_blocks_per_logical: int,
     ) -> tuple[list[int], list[int]]:
         if not local_ids:
             return [], []
-        if is_ssm:
+        if route.is_ssm:
             matched = min(len(local_ids), len(remote_ids))
             return local_ids[-matched:], remote_ids[-matched:]
 
@@ -165,92 +165,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             local_ids = self.get_mapped_blocks(
                 np.asarray(local_ids), block_size_ratio
             ).tolist()
-        if len(local_ids) > len(remote_ids):
-            return local_ids[: len(remote_ids)], remote_ids
-        if len(remote_ids) > len(local_ids):
-            return local_ids, remote_ids[-len(local_ids) :]
-        return local_ids, remote_ids
-
-    def _compute_layer_routed_desc_ids(
-        self,
-        selection: LayerRouteSelection,
-        block_ids: BlockIds,
-        remote: bool,
-    ) -> np.ndarray:
-        desc_ids: list[int] = []
-        for layer_block_ids, route, layout in zip(
-            block_ids, selection.routes, selection.layouts, strict=True
-        ):
-            offset = layout.remote_offset if remote else layout.local_offset
-            count = layout.remote_count if remote else layout.local_count
-            if route.is_ssm:
-                segment_count = selection.segment_count
-                capacity = count // segment_count
-                for block_id in layer_block_ids:
-                    desc_ids.extend(
-                        offset + segment * capacity + block_id
-                        for segment in range(segment_count)
-                    )
-            else:
-                desc_ids.extend(offset + block_id for block_id in layer_block_ids)
-        return np.asarray(desc_ids, dtype=np.int64)
-
-    def _read_blocks_for_req_layer_routed(self, req_id: str, meta: ReqMeta) -> None:
-        assert meta.remote is not None and self.transfer_topo is not None
-        engine_id = meta.remote.engine_id
-        plan = self.tp_mappings[engine_id]
-        selection = self._layer_route_selections[engine_id]
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-
-        local_layer_ids: list[list[int]] = []
-        remote_layer_ids: list[list[int]] = []
-        for route, layout in zip(selection.routes, selection.layouts, strict=True):
-            local_ids = list(meta.local_physical_block_ids[route.local_group_id])
-            local_ids, remote_ids = self._align_layer_block_ids(
-                local_ids,
-                list(meta.remote.block_ids[route.remote_group_id]),
-                route.is_ssm,
-                block_size_ratio,
-                remote_info.remote_physical_blocks_per_logical,
-            )
-            local_layer_ids.append(local_ids)
-            remote_layer_ids.append(remote_ids)
-
-        read_specs = [
-            ReadSpec(
-                remote_rank=remote_rank,
-                local_block_ids=local_layer_ids,
-                remote_block_ids=remote_layer_ids,
-                layer_routed=True,
-            )
-            for remote_rank in plan.all_source_ranks
-        ]
-
-        # Layer-routed descriptors already write the local LBHNC layout. Skip
-        # the group-indexed region completion path.
-        meta.region_blocks_to_zero = ()
-        local_handles = self._layer_routed_src_handles[engine_id]
-        for i, read_spec in enumerate(read_specs):
-            local_handle = (
-                local_handles[i] if len(local_handles) > 1 else local_handles[0]
-            )
-            if not self._read_blocks(
-                read_spec=read_spec,
-                request_id=req_id,
-                dst_engine_id=engine_id,
-                remote_request_id=meta.remote.request_id,
-                local_xfer_side_handle=local_handle,
-                local_dram_handle=None,
-                remote_xfer_side_handle=self.dst_xfer_side_handles[engine_id][
-                    read_spec.remote_rank
-                ],
-                expected_consumers=plan.local_consumers,
-                awaiting_kvs=meta.awaiting_kvs,
-            ):
-                return
+        matched = min(len(local_ids), len(remote_ids))
+        return local_ids[:matched], remote_ids[-matched:]
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -281,10 +197,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Seed the entry so this rank still reports completion.
             self._recving_transfers.setdefault(req_id, [])
 
-        if engine_id in self._layer_route_selections:
-            self._read_blocks_for_req_layer_routed(req_id, meta)
-            return
-
         plan = self.tp_mappings[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
@@ -293,7 +205,56 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids = meta.local_physical_block_ids
         remote_region_groups = self.dst_region_group_ids[engine_id]
         local_region_groups = self.region_group_ids or remote_region_groups
-        if not local_block_ids:
+        if engine_id in self._layer_routes:
+            routes = self._layer_routes[engine_id]
+            block_size_ratio = self.transfer_topo.block_size_ratio(
+                remote_info.remote_block_size
+            )
+            local_layer_ids: list[list[int]] = []
+            remote_layer_ids: list[list[int]] = []
+            for route in routes:
+                local_route_ids, remote_route_ids = self._align_layer_block_ids(
+                    route,
+                    list(meta.local_physical_block_ids[route.local_group_id]),
+                    list(meta.remote.block_ids[route.remote_group_id]),
+                    block_size_ratio,
+                    remote_info.remote_physical_blocks_per_logical,
+                )
+                local_layer_ids.append(local_route_ids)
+                remote_layer_ids.append(remote_route_ids)
+            remote_logical_blocks = (
+                self.dst_num_blocks[engine_id]
+                // remote_info.remote_physical_blocks_per_logical
+            )
+            local_desc_ids = self._compute_layer_desc_ids(
+                engine_id,
+                routes,
+                local_layer_ids,
+                False,
+                block_size_ratio,
+                remote_logical_blocks,
+            )
+            remote_desc_ids = self._compute_layer_desc_ids(
+                engine_id,
+                routes,
+                remote_layer_ids,
+                True,
+                block_size_ratio,
+                remote_logical_blocks,
+            )
+            read_specs = [
+                ReadSpec(
+                    remote_rank=rank,
+                    local_block_ids=local_layer_ids,
+                    remote_block_ids=remote_layer_ids,
+                    layer_routed=True,
+                    local_desc_ids=local_desc_ids,
+                    remote_desc_ids=remote_desc_ids,
+                )
+                for rank in plan.all_source_ranks
+            ]
+            meta.region_blocks_to_zero = ()
+        elif not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
             # _read_blocks so its existing cache-hit notification path runs.
             read_specs = [
@@ -603,19 +564,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
 
-        if read_spec.layer_routed:
-            selection = self._layer_route_selections[dst_engine_id]
-            remote_block_descs_ids = self._compute_layer_routed_desc_ids(
-                selection,
-                remote_block_ids,
-                remote=True,
-            )
-            local_block_descs_ids = self._compute_layer_routed_desc_ids(
-                selection,
-                local_block_ids,
-                remote=False,
-            )
-        else:
+        if read_spec.local_desc_ids is None:
             remote_block_descs_ids = self._compute_desc_ids(
                 block_ids=remote_block_ids,
                 dst_num_blocks=self.dst_num_blocks[dst_engine_id],
@@ -656,6 +605,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     else self._uses_region_group_mapping
                 ),
             )
+        else:
+            local_block_descs_ids = read_spec.local_desc_ids
+            remote_block_descs_ids = read_spec.remote_desc_ids
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
