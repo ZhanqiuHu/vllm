@@ -181,22 +181,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
     ) -> np.ndarray:
         desc_ids: list[int] = []
         for layer_block_ids, layout in zip(block_ids, layouts, strict=True):
+            offset = layout.remote_offset if remote else layout.local_offset
+            count = layout.remote_count if remote else layout.local_count
             if layout.is_ssm:
-                capacity = (
-                    layout.remote_count if remote else layout.local_count
-                ) // layout.segment_count
+                capacity = count // layout.segment_count
                 for block_id in layer_block_ids:
                     desc_ids.extend(
-                        (layout.remote_offset if remote else layout.local_offset)
-                        + segment * capacity
-                        + block_id
+                        offset + segment * capacity + block_id
                         for segment in range(layout.segment_count)
                     )
             else:
-                desc_ids.extend(
-                    (layout.remote_offset if remote else layout.local_offset) + block_id
-                    for block_id in layer_block_ids
-                )
+                desc_ids.extend(offset + block_id for block_id in layer_block_ids)
         return np.asarray(desc_ids, dtype=np.int64)
 
     def _read_blocks_for_req_layer_routed(self, req_id: str, meta: ReqMeta) -> None:
