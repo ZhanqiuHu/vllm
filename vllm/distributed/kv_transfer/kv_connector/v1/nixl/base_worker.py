@@ -107,7 +107,6 @@ _SHARED_REGION_GROUP_ID = -1
 class LayerRoute:
     """Layer-to-layer routing for heterogeneous KV cache grouping."""
 
-    layer_name: str
     local_group_id: int
     remote_group_id: int
     region_routes: tuple[tuple[int, int], ...]
@@ -2405,7 +2404,6 @@ class NixlBaseConnectorWorker:
                 )
             routes.append(
                 LayerRoute(
-                    layer_name=layer_name,
                     local_group_id=self._layer_group_ids[layer_name],
                     remote_group_id=nixl_agent_meta.layer_group_ids[layer_name],
                     region_routes=region_routes,
