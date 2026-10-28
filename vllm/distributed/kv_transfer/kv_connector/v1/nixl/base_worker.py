@@ -2475,6 +2475,10 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.region_mem_types
             or [self.nixl_memory_type] * num_remote_regions
         )
+        if len(set(self.dst_region_mem_types[engine_id])) != 1:
+            raise NotImplementedError(
+                "NIXL pull does not yet support a mixed-memory producer"
+            )
 
     def _add_layer_routed_remote_agent(
         self,
@@ -2496,9 +2500,12 @@ class NixlBaseConnectorWorker:
             transfer_info,
             block_size_ratio,
         )
-        remote_region_num_blocks = nixl_agent_meta.region_num_blocks or [
-            nixl_agent_meta.num_blocks
-        ] * len(nixl_agent_meta.kv_caches_base_addr)
+        self._register_remote_region_metadata(
+            engine_id,
+            nixl_agent_meta,
+            nixl_agent_meta.region_group_ids
+            or [0] * len(nixl_agent_meta.kv_caches_base_addr),
+        )
         remote_logical_blocks = nixl_agent_meta.num_blocks // (
             transfer_info.remote_physical_blocks_per_logical
         )
@@ -2506,7 +2513,7 @@ class NixlBaseConnectorWorker:
             selection,
             layouts=self._build_layer_descriptor_layouts(
                 selection,
-                remote_region_num_blocks,
+                self.dst_region_num_blocks[engine_id],
                 remote_logical_blocks,
                 block_size_ratio,
             ),
@@ -2548,25 +2555,13 @@ class NixlBaseConnectorWorker:
                 )
             self._layer_routed_src_handles[engine_id] = handles
 
-        remote_mem_types = set(
-            nixl_agent_meta.region_mem_types or [self.nixl_memory_type]
-        )
-        if len(remote_mem_types) != 1:
-            raise NotImplementedError(
-                "Layer-routed NIXL transfers do not support mixed producer memory"
-            )
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(
                 remote_agent_name,
-                self.nixl_wrapper.get_xfer_descs(remote_blocks, remote_mem_types.pop()),
+                self.nixl_wrapper.get_xfer_descs(
+                    remote_blocks, self.dst_region_mem_types[engine_id][0]
+                ),
             )
-        )
-
-        self._register_remote_region_metadata(
-            engine_id,
-            nixl_agent_meta,
-            nixl_agent_meta.region_group_ids
-            or [0] * len(nixl_agent_meta.kv_caches_base_addr),
         )
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
@@ -2824,14 +2819,13 @@ class NixlBaseConnectorWorker:
             mamba = self._build_mamba_remote(nixl_agent_meta, tp_ratio, transfer_info)
             blocks_data = np.concatenate([blocks_data, mamba])
 
-        remote_mem_types = set(self.dst_region_mem_types[engine_id])
-        if len(remote_mem_types) != 1:
-            raise NotImplementedError(
-                "NIXL pull does not yet support a mixed-memory producer"
-            )
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, remote_mem_types.pop())
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
-            self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+            self.nixl_wrapper.prep_xfer_dlist(
+                remote_agent_name,
+                self.nixl_wrapper.get_xfer_descs(
+                    blocks_data, self.dst_region_mem_types[engine_id][0]
+                ),
+            )
         )
 
         return remote_agent_name
