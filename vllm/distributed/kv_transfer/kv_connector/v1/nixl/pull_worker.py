@@ -201,29 +201,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             remote_info.remote_block_size
         )
 
-        read_specs = []
-        for remote_rank in plan.all_source_ranks:
-            local_layer_ids: list[list[int]] = []
-            remote_layer_ids: list[list[int]] = []
-            for route, layout in zip(selection.routes, selection.layouts, strict=True):
-                local_ids = list(meta.local_physical_block_ids[route.local_group_id])
-                local_ids, remote_ids = self._align_layer_block_ids(
-                    local_ids,
-                    list(meta.remote.block_ids[route.remote_group_id]),
-                    layout.is_ssm,
-                    block_size_ratio,
-                    remote_info.remote_physical_blocks_per_logical,
-                )
-                local_layer_ids.append(local_ids)
-                remote_layer_ids.append(remote_ids)
-            read_specs.append(
-                ReadSpec(
-                    remote_rank=remote_rank,
-                    local_block_ids=local_layer_ids,
-                    remote_block_ids=remote_layer_ids,
-                    layer_routed=True,
-                )
+        local_layer_ids: list[list[int]] = []
+        remote_layer_ids: list[list[int]] = []
+        for route, layout in zip(selection.routes, selection.layouts, strict=True):
+            local_ids = list(meta.local_physical_block_ids[route.local_group_id])
+            local_ids, remote_ids = self._align_layer_block_ids(
+                local_ids,
+                list(meta.remote.block_ids[route.remote_group_id]),
+                layout.is_ssm,
+                block_size_ratio,
+                remote_info.remote_physical_blocks_per_logical,
             )
+            local_layer_ids.append(local_ids)
+            remote_layer_ids.append(remote_ids)
+
+        read_specs = [
+            ReadSpec(
+                remote_rank=remote_rank,
+                local_block_ids=local_layer_ids,
+                remote_block_ids=remote_layer_ids,
+                layer_routed=True,
+            )
+            for remote_rank in plan.all_source_ranks
+        ]
 
         # Layer-routed descriptors already write the local LBHNC layout. Skip
         # the group-indexed region completion path.
