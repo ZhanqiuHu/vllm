@@ -2223,11 +2223,15 @@ class NixlBaseConnectorWorker:
             routes.append((entry, region_routes))
         return routes
 
-    def _build_layer_routed_local_blocks(
-        self,
-        routing_plan: tuple[LayerRoutingPlan, ...],
-        block_size_ratio: int,
-    ) -> tuple[np.ndarray, tuple[LayerDescriptorLayout, ...]]:
+    def _select_layer_region_routes(
+        self, routing_plan: tuple[LayerRoutingPlan, ...]
+    ) -> tuple[
+        list[tuple[LayerRoutingPlan, list[tuple[int, int]]]],
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+        list[bool],
+        int,
+    ]:
         routes = self._layer_region_routes(routing_plan)
         fa_routes: list[tuple[int, int]] = []
         ssm_routes: list[tuple[int, int]] = []
@@ -2249,6 +2253,16 @@ class NixlBaseConnectorWorker:
                 raise ValueError(
                     f"Unsupported layer spec for layer-routed transfer: {spec_type}"
                 )
+        return routes, fa_routes, ssm_routes, layer_types, segment_count
+
+    def _build_layer_routed_local_blocks(
+        self,
+        routing_plan: tuple[LayerRoutingPlan, ...],
+        block_size_ratio: int,
+    ) -> tuple[np.ndarray, tuple[LayerDescriptorLayout, ...]]:
+        routes, fa_routes, ssm_routes, layer_types, segment_count = (
+            self._select_layer_region_routes(routing_plan)
+        )
 
         parts: list[np.ndarray] = []
         if fa_routes:
@@ -2320,14 +2334,9 @@ class NixlBaseConnectorWorker:
         block_size_ratio: int,
     ) -> tuple[np.ndarray, tuple[LayerDescriptorLayout, ...]]:
         assert self.transfer_topo is not None
-        routes = self._layer_region_routes(routing_plan)
-        fa_routes: list[tuple[int, int]] = []
-        ssm_routes: list[tuple[int, int]] = []
-        layer_types: list[bool] = []
-        segment_count = 1
-        if self._has_mamba:
-            assert self._conv_decomp is not None
-            segment_count = len(self._conv_decomp.local_conv_offsets) + 1
+        routes, fa_routes, ssm_routes, layer_types, segment_count = (
+            self._select_layer_region_routes(routing_plan)
+        )
 
         remote_region_num_blocks = nixl_agent_meta.region_num_blocks or [
             nixl_agent_meta.num_blocks
