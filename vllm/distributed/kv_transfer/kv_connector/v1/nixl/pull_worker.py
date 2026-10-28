@@ -150,6 +150,29 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             np.asarray(block_ids), physical_blocks_per_logical
         ).tolist()
 
+    def _align_layer_block_ids(
+        self,
+        local_ids: list[int],
+        remote_ids: list[int],
+        is_ssm: bool,
+        block_size_ratio: int,
+    ) -> tuple[list[int], list[int]]:
+        if not local_ids:
+            return [], []
+        if is_ssm:
+            matched = min(len(local_ids), len(remote_ids))
+            return local_ids[-matched:], remote_ids[-matched:]
+
+        if block_size_ratio > 1:
+            local_ids = self.get_mapped_blocks(
+                np.asarray(local_ids), block_size_ratio
+            ).tolist()
+        if len(local_ids) > len(remote_ids):
+            return local_ids[: len(remote_ids)], remote_ids
+        if len(remote_ids) > len(local_ids):
+            return local_ids, remote_ids[-len(local_ids) :]
+        return local_ids, remote_ids
+
     def _compute_layer_routed_desc_ids(
         self,
         block_ids: BlockIds,
@@ -198,21 +221,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     layout.is_ssm,
                     remote_info.remote_physical_blocks_per_logical,
                 )
-                if not local_ids:
-                    local_ids, remote_ids = [], []
-                elif layout.is_ssm:
-                    matched = min(len(local_ids), len(remote_ids))
-                    local_ids = local_ids[-matched:]
-                    remote_ids = remote_ids[-matched:]
-                else:
-                    if block_size_ratio > 1:
-                        local_ids = self.get_mapped_blocks(
-                            np.asarray(local_ids), block_size_ratio
-                        ).tolist()
-                    if len(local_ids) > len(remote_ids):
-                        local_ids = local_ids[: len(remote_ids)]
-                    elif len(remote_ids) > len(local_ids):
-                        remote_ids = remote_ids[-len(local_ids) :]
+                local_ids, remote_ids = self._align_layer_block_ids(
+                    local_ids,
+                    remote_ids,
+                    layout.is_ssm,
+                    block_size_ratio,
+                )
                 local_layer_ids.append(local_ids)
                 remote_layer_ids.append(remote_ids)
             read_specs.append(
