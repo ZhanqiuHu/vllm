@@ -2255,6 +2255,26 @@ class NixlBaseConnectorWorker:
                 )
         return routes, fa_routes, ssm_routes, layer_types, segment_count
 
+    def _merge_layer_descriptor_layouts(
+        self,
+        local_layouts: tuple[LayerDescriptorLayout, ...],
+        remote_layouts: tuple[LayerDescriptorLayout, ...],
+    ) -> tuple[LayerDescriptorLayout, ...]:
+        return tuple(
+            LayerDescriptorLayout(
+                layer_name=local_layout.layer_name,
+                is_ssm=local_layout.is_ssm,
+                local_offset=local_layout.local_offset,
+                remote_offset=remote_layout.remote_offset,
+                local_count=local_layout.local_count,
+                remote_count=remote_layout.remote_count,
+                segment_count=local_layout.segment_count,
+            )
+            for local_layout, remote_layout in zip(
+                local_layouts, remote_layouts, strict=True
+            )
+        )
+
     def _build_layer_routed_local_blocks(
         self,
         routing_plan: tuple[LayerRoutingPlan, ...],
@@ -2544,19 +2564,8 @@ class NixlBaseConnectorWorker:
             transfer_info,
             block_size_ratio,
         )
-        self._layer_descriptor_layouts[engine_id] = tuple(
-            LayerDescriptorLayout(
-                layer_name=local_layout.layer_name,
-                is_ssm=local_layout.is_ssm,
-                local_offset=local_layout.local_offset,
-                remote_offset=remote_layout.remote_offset,
-                local_count=local_layout.local_count,
-                remote_count=remote_layout.remote_count,
-                segment_count=local_layout.segment_count,
-            )
-            for local_layout, remote_layout in zip(
-                local_layouts, remote_layouts, strict=True
-            )
+        self._layer_descriptor_layouts[engine_id] = (
+            self._merge_layer_descriptor_layouts(local_layouts, remote_layouts)
         )
 
         if engine_id not in self._layer_routed_src_handles:
