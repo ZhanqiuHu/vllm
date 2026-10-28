@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -133,6 +133,7 @@ class LayerRouteSelection:
 
     routes: tuple[LayerRoute, ...]
     segment_count: int
+    layouts: tuple[LayerDescriptorLayout, ...] = ()
 
 
 def _kv_group_membership(layer_group_ids: dict[str, int]) -> frozenset[frozenset[str]]:
@@ -1394,10 +1395,7 @@ class NixlBaseConnectorWorker:
         self._layer_region_indices: dict[str, list[int]] = {
             layer_name: [] for layer_name in self._layer_group_ids
         }
-        self._layer_routing_plans: dict[EngineId, tuple[LayerRoute, ...]] = {}
-        self._layer_descriptor_layouts: dict[
-            EngineId, tuple[LayerDescriptorLayout, ...]
-        ] = {}
+        self._layer_route_selections: dict[EngineId, LayerRouteSelection] = {}
         self._layer_routed_src_handles: dict[EngineId, tuple[int, ...]] = {}
         self._layer_routed_dst_handles: dict[tuple[EngineId, int], int] = {}
 
@@ -2361,8 +2359,8 @@ class NixlBaseConnectorWorker:
 
     def _prepare_layer_routes(
         self, nixl_agent_meta: NixlAgentMetadata
-    ) -> tuple[LayerRoute, ...]:
-        """Build pull routes in local model-layer order."""
+    ) -> LayerRouteSelection:
+        """Build the pull routing selection in local model-layer order."""
         local_layout = (
             self.host_buffer_kv_cache_layout
             if self.use_host_buffer
@@ -2418,15 +2416,23 @@ class NixlBaseConnectorWorker:
                 )
             )
 
-        layer_routes = tuple(routes)
-        existing_routes = self._layer_routing_plans.get(nixl_agent_meta.engine_id)
-        if existing_routes is not None and existing_routes != layer_routes:
+        if self._has_mamba:
+            assert self._conv_decomp is not None
+            segment_count = len(self._conv_decomp.local_conv_offsets) + 1
+        else:
+            segment_count = 1
+        selection = LayerRouteSelection(
+            routes=tuple(routes),
+            segment_count=segment_count,
+        )
+        existing = self._layer_route_selections.get(nixl_agent_meta.engine_id)
+        if existing is not None and existing.routes != selection.routes:
             raise RuntimeError(
                 "Remote engine advertised inconsistent layer routing: "
                 f"engine={nixl_agent_meta.engine_id}"
             )
-        self._layer_routing_plans[nixl_agent_meta.engine_id] = layer_routes
-        return layer_routes
+        self._layer_route_selections[nixl_agent_meta.engine_id] = selection
+        return selection
 
     def _add_layer_routed_remote_agent(
         self,
@@ -2456,15 +2462,7 @@ class NixlBaseConnectorWorker:
             remote_dcp_size=remote_dcp_size,
         )
         self.tp_mappings[engine_id] = plan
-        if self._has_mamba:
-            assert self._conv_decomp is not None
-            segment_count = len(self._conv_decomp.local_conv_offsets) + 1
-        else:
-            segment_count = 1
-        selection = LayerRouteSelection(
-            routes=self._layer_routing_plans[engine_id],
-            segment_count=segment_count,
-        )
+        selection = self._layer_route_selections[engine_id]
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
@@ -2484,14 +2482,16 @@ class NixlBaseConnectorWorker:
         remote_logical_blocks = nixl_agent_meta.num_blocks // (
             transfer_info.remote_physical_blocks_per_logical
         )
-        self._layer_descriptor_layouts[engine_id] = (
-            self._build_layer_descriptor_layouts(
+        selection = replace(
+            selection,
+            layouts=self._build_layer_descriptor_layouts(
                 selection,
                 remote_region_num_blocks,
                 remote_logical_blocks,
                 block_size_ratio,
-            )
+            ),
         )
+        self._layer_route_selections[engine_id] = selection
 
         if engine_id not in self._layer_routed_src_handles:
             fa_routes = self._layer_routes_by_type(selection, is_ssm=False)
@@ -2632,7 +2632,7 @@ class NixlBaseConnectorWorker:
             logger.info(
                 "Detected heterogeneous KV grouping for engine %s: %d routed layers",
                 engine_id,
-                len(routing_plan),
+                len(routing_plan.routes),
             )
             return self._add_layer_routed_remote_agent(
                 nixl_agent_meta,
@@ -4011,8 +4011,7 @@ class NixlBaseConnectorWorker:
         self.dst_uses_region_group_mapping.pop(engine_id, None)
         self.dst_region_mem_types.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
-        self._layer_routing_plans.pop(engine_id, None)
-        self._layer_descriptor_layouts.pop(engine_id, None)
+        self._layer_route_selections.pop(engine_id, None)
         for handle in self._layer_routed_src_handles.pop(engine_id, ()):
             self.nixl_wrapper.release_dlist_handle(handle)
         for (handle_engine_id, _rank), handle in list(

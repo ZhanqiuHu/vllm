@@ -195,8 +195,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         plan = self.tp_mappings[engine_id]
-        routing_plan = self._layer_routing_plans[engine_id]
-        layouts = self._layer_descriptor_layouts[engine_id]
+        selection = self._layer_route_selections[engine_id]
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
@@ -206,7 +205,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for remote_rank in plan.all_source_ranks:
             local_layer_ids: list[list[int]] = []
             remote_layer_ids: list[list[int]] = []
-            for route, layout in zip(routing_plan, layouts, strict=True):
+            for route, layout in zip(selection.routes, selection.layouts, strict=True):
                 local_ids = list(meta.local_physical_block_ids[route.local_group_id])
                 local_ids, remote_ids = self._align_layer_block_ids(
                     local_ids,
@@ -278,7 +277,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # Seed the entry so this rank still reports completion.
             self._recving_transfers.setdefault(req_id, [])
 
-        if engine_id in self._layer_routing_plans:
+        if engine_id in self._layer_route_selections:
             self._read_blocks_for_req_layer_routed(req_id, meta)
             return
 
@@ -603,12 +602,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         if read_spec.layer_routed:
             remote_block_descs_ids = self._compute_layer_routed_desc_ids(
                 remote_block_ids,
-                self._layer_descriptor_layouts[dst_engine_id],
+                self._layer_route_selections[dst_engine_id].layouts,
                 remote=True,
             )
             local_block_descs_ids = self._compute_layer_routed_desc_ids(
                 local_block_ids,
-                self._layer_descriptor_layouts[dst_engine_id],
+                self._layer_route_selections[dst_engine_id].layouts,
                 remote=False,
             )
         else:
