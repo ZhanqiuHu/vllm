@@ -2491,10 +2491,8 @@ class NixlBaseConnectorWorker:
         self._layer_route_selections[engine_id] = selection
 
         if engine_id not in self._layer_routed_src_handles:
-            fa_routes = self._layer_routes_by_type(selection, is_ssm=False)
             num_fa_descs = sum(
-                self.region_num_blocks[local_region] * block_size_ratio
-                for local_region, _ in fa_routes
+                layout.local_count for layout in selection.layouts if not layout.is_ssm
             )
             if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 split_blocks = self._build_local_splits_from_plan(
