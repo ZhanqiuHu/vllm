@@ -110,8 +110,6 @@ class LayerRoute:
     layer_name: str
     local_group_id: int
     remote_group_id: int
-    local_region_indices: tuple[int, ...]
-    remote_region_indices: tuple[int, ...]
     region_routes: tuple[tuple[int, int], ...]
     is_ssm: bool
 
@@ -2415,8 +2413,6 @@ class NixlBaseConnectorWorker:
                     layer_name=layer_name,
                     local_group_id=self._layer_group_ids[layer_name],
                     remote_group_id=nixl_agent_meta.layer_group_ids[layer_name],
-                    local_region_indices=local_region_indices,
-                    remote_region_indices=remote_region_indices,
                     region_routes=region_routes,
                     is_ssm=is_ssm,
                 )

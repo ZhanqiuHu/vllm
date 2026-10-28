@@ -141,27 +141,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         deadline = blocks_expiry_time - clock_offset
         return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
 
-    def _expand_remote_layer_block_ids(
-        self, block_ids: list[int], is_ssm: bool, physical_blocks_per_logical: int
-    ) -> list[int]:
-        if is_ssm or physical_blocks_per_logical == 1:
-            return list(block_ids)
-        return self.get_mapped_blocks(
-            np.asarray(block_ids), physical_blocks_per_logical
-        ).tolist()
-
     def _align_layer_block_ids(
         self,
         local_ids: list[int],
         remote_ids: list[int],
         is_ssm: bool,
         block_size_ratio: int,
+        remote_physical_blocks_per_logical: int,
     ) -> tuple[list[int], list[int]]:
         if not local_ids:
             return [], []
         if is_ssm:
             matched = min(len(local_ids), len(remote_ids))
             return local_ids[-matched:], remote_ids[-matched:]
+
+        if remote_physical_blocks_per_logical > 1:
+            remote_ids = self.get_mapped_blocks(
+                np.asarray(remote_ids), remote_physical_blocks_per_logical
+            ).tolist()
 
         if block_size_ratio > 1:
             local_ids = self.get_mapped_blocks(
@@ -211,16 +208,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             remote_layer_ids: list[list[int]] = []
             for route, layout in zip(routing_plan, layouts, strict=True):
                 local_ids = list(meta.local_physical_block_ids[route.local_group_id])
-                remote_ids = self._expand_remote_layer_block_ids(
-                    meta.remote.block_ids[route.remote_group_id],
-                    layout.is_ssm,
-                    remote_info.remote_physical_blocks_per_logical,
-                )
                 local_ids, remote_ids = self._align_layer_block_ids(
                     local_ids,
-                    remote_ids,
+                    list(meta.remote.block_ids[route.remote_group_id]),
                     layout.is_ssm,
                     block_size_ratio,
+                    remote_info.remote_physical_blocks_per_logical,
                 )
                 local_layer_ids.append(local_ids)
                 remote_layer_ids.append(remote_ids)
