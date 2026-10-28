@@ -9,6 +9,7 @@ import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    LayerRouteSelection,
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -172,20 +173,23 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
     def _compute_layer_routed_desc_ids(
         self,
+        selection: LayerRouteSelection,
         block_ids: BlockIds,
-        layouts,
         remote: bool,
     ) -> np.ndarray:
         desc_ids: list[int] = []
-        for layer_block_ids, layout in zip(block_ids, layouts, strict=True):
+        for layer_block_ids, route, layout in zip(
+            block_ids, selection.routes, selection.layouts, strict=True
+        ):
             offset = layout.remote_offset if remote else layout.local_offset
             count = layout.remote_count if remote else layout.local_count
-            if layout.is_ssm:
-                capacity = count // layout.segment_count
+            if route.is_ssm:
+                segment_count = selection.segment_count
+                capacity = count // segment_count
                 for block_id in layer_block_ids:
                     desc_ids.extend(
                         offset + segment * capacity + block_id
-                        for segment in range(layout.segment_count)
+                        for segment in range(segment_count)
                     )
             else:
                 desc_ids.extend(offset + block_id for block_id in layer_block_ids)
@@ -208,7 +212,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             local_ids, remote_ids = self._align_layer_block_ids(
                 local_ids,
                 list(meta.remote.block_ids[route.remote_group_id]),
-                layout.is_ssm,
+                route.is_ssm,
                 block_size_ratio,
                 remote_info.remote_physical_blocks_per_logical,
             )
@@ -600,14 +604,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         if read_spec.layer_routed:
+            selection = self._layer_route_selections[dst_engine_id]
             remote_block_descs_ids = self._compute_layer_routed_desc_ids(
+                selection,
                 remote_block_ids,
-                self._layer_route_selections[dst_engine_id].layouts,
                 remote=True,
             )
             local_block_descs_ids = self._compute_layer_routed_desc_ids(
+                selection,
                 local_block_ids,
-                self._layer_route_selections[dst_engine_id].layouts,
                 remote=False,
             )
         else:

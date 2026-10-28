@@ -117,12 +117,10 @@ class LayerRoute:
 class LayerDescriptorLayout:
     """Descriptor layout for one layer in a layer-routed transfer."""
 
-    is_ssm: bool
     local_offset: int
     remote_offset: int
     local_count: int
     remote_count: int
-    segment_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -2248,12 +2246,10 @@ class NixlBaseConnectorWorker:
                 )
                 layouts.append(
                     LayerDescriptorLayout(
-                        is_ssm=True,
                         local_offset=local_ssm_offset,
                         remote_offset=remote_ssm_offset,
                         local_count=local_count,
                         remote_count=remote_count,
-                        segment_count=selection.segment_count,
                     )
                 )
                 local_ssm_offset += local_count
@@ -2269,7 +2265,6 @@ class NixlBaseConnectorWorker:
                 )
                 layouts.append(
                     LayerDescriptorLayout(
-                        is_ssm=False,
                         local_offset=local_fa_offset,
                         remote_offset=remote_fa_offset,
                         local_count=local_count,
@@ -2490,7 +2485,11 @@ class NixlBaseConnectorWorker:
 
         if engine_id not in self._layer_routed_src_handles:
             num_fa_descs = sum(
-                layout.local_count for layout in selection.layouts if not layout.is_ssm
+                layout.local_count
+                for route, layout in zip(
+                    selection.routes, selection.layouts, strict=True
+                )
+                if not route.is_ssm
             )
             if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 split_blocks = self._build_local_splits_from_plan(
