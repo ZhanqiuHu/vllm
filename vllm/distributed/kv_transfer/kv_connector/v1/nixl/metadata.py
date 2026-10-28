@@ -48,8 +48,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
 #  12: Add per-region member names for PP push
+#  13: Add per-layer group and region membership for handshake routing
 #
-NIXL_CONNECTOR_VERSION: int = 12
+NIXL_CONNECTOR_VERSION: int = 13
 
 
 @dataclass
@@ -74,6 +75,11 @@ class NixlAgentMetadata:
     pcp_size: int = 1
     # Layer names sharing each advertised region, in region order.
     region_members: list[list[str]] = field(default_factory=list)
+    # Transfer-group ID and NIXL-region IDs for each transferable layer.
+    # Regions are folded by address, so region_members alone cannot recover
+    # the group membership needed to detect heterogeneous KV grouping.
+    layer_group_ids: dict[str, int] = field(default_factory=dict)
+    layer_region_indices: dict[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass

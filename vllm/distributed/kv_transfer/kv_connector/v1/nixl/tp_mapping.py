@@ -27,6 +27,7 @@ class ReadSpec:
     local_block_ids: BlockIds
     remote_block_ids: BlockIds
     block_ids_by_region: bool = False
+    layer_routed: bool = False
 
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
