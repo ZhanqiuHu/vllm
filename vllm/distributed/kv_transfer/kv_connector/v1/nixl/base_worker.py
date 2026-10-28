@@ -1393,7 +1393,6 @@ class NixlBaseConnectorWorker:
         }
         self._layer_route_selections: dict[EngineId, LayerRouteSelection] = {}
         self._layer_routed_src_handles: dict[EngineId, tuple[int, ...]] = {}
-        self._layer_routed_dst_handles: dict[tuple[EngineId, int], int] = {}
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.transfer_tp_rank,
@@ -2556,7 +2555,7 @@ class NixlBaseConnectorWorker:
             raise NotImplementedError(
                 "Layer-routed NIXL transfers do not support mixed producer memory"
             )
-        self._layer_routed_dst_handles[(engine_id, remote_tp_rank)] = (
+        self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(
                 remote_agent_name,
                 self.nixl_wrapper.get_xfer_descs(remote_blocks, remote_mem_types.pop()),
@@ -4002,12 +4001,6 @@ class NixlBaseConnectorWorker:
         self._layer_route_selections.pop(engine_id, None)
         for handle in self._layer_routed_src_handles.pop(engine_id, ()):
             self.nixl_wrapper.release_dlist_handle(handle)
-        for (handle_engine_id, _rank), handle in list(
-            self._layer_routed_dst_handles.items()
-        ):
-            if handle_engine_id == engine_id:
-                self.nixl_wrapper.release_dlist_handle(handle)
-                del self._layer_routed_dst_handles[(handle_engine_id, _rank)]
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
 

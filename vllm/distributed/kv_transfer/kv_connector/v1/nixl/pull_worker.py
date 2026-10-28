@@ -244,8 +244,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_request_id=meta.remote.request_id,
                 local_xfer_side_handle=local_handle,
                 local_dram_handle=None,
-                remote_xfer_side_handle=self._layer_routed_dst_handles[
-                    (engine_id, read_spec.remote_rank)
+                remote_xfer_side_handle=self.dst_xfer_side_handles[engine_id][
+                    read_spec.remote_rank
                 ],
                 expected_consumers=plan.local_consumers,
                 awaiting_kvs=meta.awaiting_kvs,
