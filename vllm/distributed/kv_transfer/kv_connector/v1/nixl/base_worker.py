@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
@@ -125,6 +125,17 @@ class LayerDescriptorLayout:
     local_count: int
     remote_count: int
     segment_count: int = 1
+
+
+@dataclass(frozen=True)
+class LayerRouteSelection:
+    """Classified layer routes for layer-routed transfers."""
+
+    routes: tuple[tuple[LayerRoutingPlan, tuple[tuple[int, int], ...]], ...]
+    fa_routes: tuple[tuple[int, int], ...]
+    ssm_routes: tuple[tuple[int, int], ...]
+    layer_types: tuple[bool, ...]
+    segment_count: int
 
 
 def _kv_group_membership(layer_group_ids: dict[str, int]) -> frozenset[frozenset[str]]:
@@ -1934,7 +1945,7 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         tp_ratio: int,
         transfer_info: EngineTransferInfo,
-        region_routes: list[tuple[int, int]] | None = None,
+        region_routes: Sequence[tuple[int, int]] | None = None,
     ) -> np.ndarray:
         """Build remote desc regions (conv sub-projections + ssm) per layer.
         For hetero-TP, each D rank reads only its sub-projection slice from
@@ -2060,7 +2071,7 @@ class NixlBaseConnectorWorker:
         plan: TPMapping,
         nixl_agent_meta: NixlAgentMetadata,
         block_size_ratio: int,
-        region_routes: list[tuple[int, int]] | None = None,
+        region_routes: Sequence[tuple[int, int]] | None = None,
     ) -> np.ndarray:
         """Build remote FA descriptors as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
@@ -2204,8 +2215,8 @@ class NixlBaseConnectorWorker:
 
     def _layer_region_routes(
         self, routing_plan: tuple[LayerRoutingPlan, ...]
-    ) -> list[tuple[LayerRoutingPlan, list[tuple[int, int]]]]:
-        routes: list[tuple[LayerRoutingPlan, list[tuple[int, int]]]] = []
+    ) -> tuple[tuple[LayerRoutingPlan, tuple[tuple[int, int], ...]], ...]:
+        routes: list[tuple[LayerRoutingPlan, tuple[tuple[int, int], ...]]] = []
         for entry in routing_plan:
             if len(entry.local_region_indices) != len(entry.remote_region_indices):
                 raise ValueError(
@@ -2213,7 +2224,7 @@ class NixlBaseConnectorWorker:
                     f"local={entry.local_region_indices}, "
                     f"remote={entry.remote_region_indices}"
                 )
-            region_routes = list(
+            region_routes = tuple(
                 zip(
                     entry.local_region_indices,
                     entry.remote_region_indices,
@@ -2221,17 +2232,11 @@ class NixlBaseConnectorWorker:
                 )
             )
             routes.append((entry, region_routes))
-        return routes
+        return tuple(routes)
 
     def _select_layer_region_routes(
         self, routing_plan: tuple[LayerRoutingPlan, ...]
-    ) -> tuple[
-        list[tuple[LayerRoutingPlan, list[tuple[int, int]]]],
-        list[tuple[int, int]],
-        list[tuple[int, int]],
-        list[bool],
-        int,
-    ]:
+    ) -> LayerRouteSelection:
         routes = self._layer_region_routes(routing_plan)
         fa_routes: list[tuple[int, int]] = []
         ssm_routes: list[tuple[int, int]] = []
@@ -2253,36 +2258,88 @@ class NixlBaseConnectorWorker:
                 raise ValueError(
                     f"Unsupported layer spec for layer-routed transfer: {spec_type}"
                 )
-        return routes, fa_routes, ssm_routes, layer_types, segment_count
-
-    def _merge_layer_descriptor_layouts(
-        self,
-        local_layouts: tuple[LayerDescriptorLayout, ...],
-        remote_layouts: tuple[LayerDescriptorLayout, ...],
-    ) -> tuple[LayerDescriptorLayout, ...]:
-        return tuple(
-            LayerDescriptorLayout(
-                layer_name=local_layout.layer_name,
-                is_ssm=local_layout.is_ssm,
-                local_offset=local_layout.local_offset,
-                remote_offset=remote_layout.remote_offset,
-                local_count=local_layout.local_count,
-                remote_count=remote_layout.remote_count,
-                segment_count=local_layout.segment_count,
-            )
-            for local_layout, remote_layout in zip(
-                local_layouts, remote_layouts, strict=True
-            )
+        return LayerRouteSelection(
+            routes=routes,
+            fa_routes=tuple(fa_routes),
+            ssm_routes=tuple(ssm_routes),
+            layer_types=tuple(layer_types),
+            segment_count=segment_count,
         )
+
+    def _build_layer_descriptor_layouts(
+        self,
+        selection: LayerRouteSelection,
+        remote_region_num_blocks: Sequence[int],
+        remote_logical_blocks: int,
+        block_size_ratio: int,
+    ) -> tuple[LayerDescriptorLayout, ...]:
+        local_fa_offset = 0
+        local_ssm_offset = sum(
+            self.region_num_blocks[local_region] * block_size_ratio
+            for local_region, _ in selection.fa_routes
+        )
+        remote_fa_offset = 0
+        remote_ssm_offset = sum(
+            remote_region_num_blocks[remote_region]
+            for _, remote_region in selection.fa_routes
+        )
+
+        layouts: list[LayerDescriptorLayout] = []
+        for (entry, region_routes), is_ssm in zip(
+            selection.routes, selection.layer_types, strict=True
+        ):
+            if is_ssm:
+                local_count = (
+                    self._logical_num_blocks
+                    * selection.segment_count
+                    * len(region_routes)
+                )
+                remote_count = (
+                    remote_logical_blocks * selection.segment_count * len(region_routes)
+                )
+                layouts.append(
+                    LayerDescriptorLayout(
+                        layer_name=entry.layer_name,
+                        is_ssm=True,
+                        local_offset=local_ssm_offset,
+                        remote_offset=remote_ssm_offset,
+                        local_count=local_count,
+                        remote_count=remote_count,
+                        segment_count=selection.segment_count,
+                    )
+                )
+                local_ssm_offset += local_count
+                remote_ssm_offset += remote_count
+            else:
+                local_count = sum(
+                    self.region_num_blocks[local_region] * block_size_ratio
+                    for local_region, _ in region_routes
+                )
+                remote_count = sum(
+                    remote_region_num_blocks[remote_region]
+                    for _, remote_region in region_routes
+                )
+                layouts.append(
+                    LayerDescriptorLayout(
+                        layer_name=entry.layer_name,
+                        is_ssm=False,
+                        local_offset=local_fa_offset,
+                        remote_offset=remote_fa_offset,
+                        local_count=local_count,
+                        remote_count=remote_count,
+                    )
+                )
+                local_fa_offset += local_count
+                remote_fa_offset += remote_count
+        return tuple(layouts)
 
     def _build_layer_routed_local_blocks(
         self,
-        routing_plan: tuple[LayerRoutingPlan, ...],
+        selection: LayerRouteSelection,
         block_size_ratio: int,
-    ) -> tuple[np.ndarray, tuple[LayerDescriptorLayout, ...]]:
-        routes, fa_routes, ssm_routes, layer_types, segment_count = (
-            self._select_layer_region_routes(routing_plan)
-        )
+    ) -> np.ndarray:
+        fa_routes = selection.fa_routes
+        ssm_routes = selection.ssm_routes
 
         parts: list[np.ndarray] = []
         if fa_routes:
@@ -2303,67 +2360,19 @@ class NixlBaseConnectorWorker:
         blocks_data = (
             np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
         )
-
-        layouts: list[LayerDescriptorLayout] = []
-        fa_offset = 0
-        ssm_offset = sum(
-            self.region_num_blocks[local_region] * block_size_ratio
-            for local_region, _ in fa_routes
-        )
-        for (entry, region_routes), is_ssm in zip(routes, layer_types, strict=True):
-            if is_ssm:
-                local_count = (
-                    self._logical_num_blocks * segment_count * len(region_routes)
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        layer_name=entry.layer_name,
-                        is_ssm=True,
-                        local_offset=ssm_offset,
-                        remote_offset=0,
-                        local_count=local_count,
-                        remote_count=0,
-                        segment_count=segment_count,
-                    )
-                )
-                ssm_offset += local_count
-            else:
-                local_count = sum(
-                    self.region_num_blocks[local_region] * block_size_ratio
-                    for local_region, _ in region_routes
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        layer_name=entry.layer_name,
-                        is_ssm=False,
-                        local_offset=fa_offset,
-                        remote_offset=0,
-                        local_count=local_count,
-                        remote_count=0,
-                    )
-                )
-                fa_offset += local_count
-        return blocks_data, tuple(layouts)
+        return blocks_data
 
     def _build_layer_routed_remote_blocks(
         self,
-        routing_plan: tuple[LayerRoutingPlan, ...],
+        selection: LayerRouteSelection,
         plan: TPMapping,
         nixl_agent_meta: NixlAgentMetadata,
         transfer_info: EngineTransferInfo,
         block_size_ratio: int,
-    ) -> tuple[np.ndarray, tuple[LayerDescriptorLayout, ...]]:
+    ) -> np.ndarray:
         assert self.transfer_topo is not None
-        routes, fa_routes, ssm_routes, layer_types, segment_count = (
-            self._select_layer_region_routes(routing_plan)
-        )
-
-        remote_region_num_blocks = nixl_agent_meta.region_num_blocks or [
-            nixl_agent_meta.num_blocks
-        ] * len(nixl_agent_meta.kv_caches_base_addr)
-        remote_logical_blocks = nixl_agent_meta.num_blocks // (
-            transfer_info.remote_physical_blocks_per_logical
-        )
+        fa_routes = selection.fa_routes
+        ssm_routes = selection.ssm_routes
 
         parts: list[np.ndarray] = []
         if fa_routes:
@@ -2388,46 +2397,7 @@ class NixlBaseConnectorWorker:
         blocks_data = (
             np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
         )
-
-        layouts: list[LayerDescriptorLayout] = []
-        fa_offset = 0
-        ssm_offset = sum(
-            remote_region_num_blocks[remote_region] for _, remote_region in fa_routes
-        )
-        for (entry, region_routes), is_ssm in zip(routes, layer_types, strict=True):
-            if is_ssm:
-                remote_count = (
-                    remote_logical_blocks * segment_count * len(region_routes)
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        layer_name=entry.layer_name,
-                        is_ssm=True,
-                        local_offset=0,
-                        remote_offset=ssm_offset,
-                        local_count=0,
-                        remote_count=remote_count,
-                        segment_count=segment_count,
-                    )
-                )
-                ssm_offset += remote_count
-            else:
-                remote_count = sum(
-                    remote_region_num_blocks[remote_region]
-                    for _, remote_region in region_routes
-                )
-                layouts.append(
-                    LayerDescriptorLayout(
-                        layer_name=entry.layer_name,
-                        is_ssm=False,
-                        local_offset=0,
-                        remote_offset=fa_offset,
-                        local_count=0,
-                        remote_count=remote_count,
-                    )
-                )
-                fa_offset += remote_count
-        return blocks_data, tuple(layouts)
+        return blocks_data
 
     def _is_heterogeneous_kv_grouping(self, nixl_agent_meta: NixlAgentMetadata) -> bool:
         """Whether P/D assign the same layers to different KV groups."""
@@ -2535,30 +2505,44 @@ class NixlBaseConnectorWorker:
             remote_dcp_size=remote_dcp_size,
         )
         self.tp_mappings[engine_id] = plan
+        selection = self._select_layer_region_routes(
+            self._layer_routing_plans[engine_id]
+        )
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
 
-        routing_plan = self._layer_routing_plans[engine_id]
         block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
         tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
-        local_blocks, local_layouts = self._build_layer_routed_local_blocks(
-            routing_plan, block_size_ratio
+        local_blocks = self._build_layer_routed_local_blocks(
+            selection, block_size_ratio
         )
-        remote_blocks, remote_layouts = self._build_layer_routed_remote_blocks(
-            routing_plan,
+        remote_blocks = self._build_layer_routed_remote_blocks(
+            selection,
             plan,
             nixl_agent_meta,
             transfer_info,
             block_size_ratio,
         )
+        remote_region_num_blocks = nixl_agent_meta.region_num_blocks or [
+            nixl_agent_meta.num_blocks
+        ] * len(nixl_agent_meta.kv_caches_base_addr)
+        remote_logical_blocks = nixl_agent_meta.num_blocks // (
+            transfer_info.remote_physical_blocks_per_logical
+        )
         self._layer_descriptor_layouts[engine_id] = (
-            self._merge_layer_descriptor_layouts(local_layouts, remote_layouts)
+            self._build_layer_descriptor_layouts(
+                selection,
+                remote_region_num_blocks,
+                remote_logical_blocks,
+                block_size_ratio,
+            )
         )
 
         if engine_id not in self._layer_routed_src_handles:
             num_fa_descs = sum(
-                layout.local_count for layout in local_layouts if not layout.is_ssm
+                self.region_num_blocks[local_region] * block_size_ratio
+                for local_region, _ in selection.fa_routes
             )
             if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 split_blocks = self._build_local_splits_from_plan(
