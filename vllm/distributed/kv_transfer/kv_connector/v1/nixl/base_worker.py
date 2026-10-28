@@ -118,7 +118,6 @@ class LayerRoute:
 class LayerDescriptorLayout:
     """Descriptor layout for one layer in a layer-routed transfer."""
 
-    layer_name: str
     is_ssm: bool
     local_offset: int
     remote_offset: int
@@ -2250,7 +2249,6 @@ class NixlBaseConnectorWorker:
                 )
                 layouts.append(
                     LayerDescriptorLayout(
-                        layer_name=route.layer_name,
                         is_ssm=True,
                         local_offset=local_ssm_offset,
                         remote_offset=remote_ssm_offset,
@@ -2272,7 +2270,6 @@ class NixlBaseConnectorWorker:
                 )
                 layouts.append(
                     LayerDescriptorLayout(
-                        layer_name=route.layer_name,
                         is_ssm=False,
                         local_offset=local_fa_offset,
                         remote_offset=remote_fa_offset,
