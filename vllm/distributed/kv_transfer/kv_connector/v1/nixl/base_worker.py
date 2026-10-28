@@ -2424,13 +2424,12 @@ class NixlBaseConnectorWorker:
         self._layer_route_selections[nixl_agent_meta.engine_id] = selection
         return selection
 
-    def _add_layer_routed_remote_agent(
+    def _prepare_remote_agent_common(
         self,
         nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_rank: int,
         remote_tp_size: int,
         remote_dcp_size: int,
-    ) -> str:
+    ) -> tuple[EngineTransferInfo, TPMapping, str, int, int]:
         assert self.transfer_topo is not None
         transfer_topo = self.transfer_topo
         engine_id = nixl_agent_meta.engine_id
@@ -2452,13 +2451,45 @@ class NixlBaseConnectorWorker:
             remote_dcp_size=remote_dcp_size,
         )
         self.tp_mappings[engine_id] = plan
-        selection = self._layer_route_selections[engine_id]
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
-
         block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
         tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
+        return transfer_info, plan, remote_agent_name, block_size_ratio, tp_ratio
+
+    def _register_remote_region_metadata(
+        self,
+        engine_id: EngineId,
+        nixl_agent_meta: NixlAgentMetadata,
+        region_group_ids: list[int],
+    ) -> None:
+        num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
+        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+        self.dst_region_num_blocks[engine_id] = (
+            nixl_agent_meta.region_num_blocks
+            or [nixl_agent_meta.num_blocks] * num_remote_regions
+        )
+        self.dst_region_group_ids[engine_id] = region_group_ids
+        self.dst_uses_region_group_mapping[engine_id] = len(set(region_group_ids)) > 1
+        self.dst_region_mem_types[engine_id] = (
+            nixl_agent_meta.region_mem_types
+            or [self.nixl_memory_type] * num_remote_regions
+        )
+
+    def _add_layer_routed_remote_agent(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_rank: int,
+        transfer_info: EngineTransferInfo,
+        plan: TPMapping,
+        remote_agent_name: str,
+        block_size_ratio: int,
+        tp_ratio: int,
+    ) -> str:
+        assert self.transfer_topo is not None
+        engine_id = nixl_agent_meta.engine_id
+        selection = self._layer_route_selections[engine_id]
         local_blocks, remote_blocks = self._build_layer_routed_blocks(
             selection,
             plan,
@@ -2532,21 +2563,11 @@ class NixlBaseConnectorWorker:
             )
         )
 
-        num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
-        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-        self.dst_region_num_blocks[engine_id] = (
-            nixl_agent_meta.region_num_blocks
-            or [nixl_agent_meta.num_blocks] * num_remote_regions
-        )
-        self.dst_region_group_ids[engine_id] = (
-            nixl_agent_meta.region_group_ids or [0] * num_remote_regions
-        )
-        self.dst_uses_region_group_mapping[engine_id] = (
-            len(set(self.dst_region_group_ids[engine_id])) > 1
-        )
-        self.dst_region_mem_types[engine_id] = (
-            nixl_agent_meta.region_mem_types
-            or [self.nixl_memory_type] * num_remote_regions
+        self._register_remote_region_metadata(
+            engine_id,
+            nixl_agent_meta,
+            nixl_agent_meta.region_group_ids
+            or [0] * len(nixl_agent_meta.kv_caches_base_addr),
         )
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
             nixl_agent_meta.kv_caches_base_addr
@@ -2629,8 +2650,11 @@ class NixlBaseConnectorWorker:
             return self._add_layer_routed_remote_agent(
                 nixl_agent_meta,
                 remote_tp_rank,
-                remote_tp_size,
-                remote_dcp_size,
+                *self._prepare_remote_agent_common(
+                    nixl_agent_meta,
+                    remote_tp_size,
+                    remote_dcp_size,
+                ),
             )
         # Number of physical regions registered locally (one per layer/tensor).
         num_local_regions = len(self.block_len_per_layer)
@@ -2675,30 +2699,18 @@ class NixlBaseConnectorWorker:
                     start:end
                 ]
 
-        ### Register remote engine in TransferTopology (idempotent).
-        physical_blocks_per_logical = (
-            nixl_agent_meta.physical_blocks_per_logical_kv_block
+        (
+            transfer_info,
+            plan,
+            remote_agent_name,
+            block_size_ratio,
+            tp_ratio,
+        ) = self._prepare_remote_agent_common(
+            nixl_agent_meta,
+            remote_tp_size,
+            remote_dcp_size,
         )
-        transfer_info = EngineTransferInfo(
-            remote_tp_size=remote_tp_size,
-            remote_block_size=nixl_agent_meta.block_size,
-            remote_block_len=nixl_agent_meta.block_lens[0],
-            remote_physical_blocks_per_logical=physical_blocks_per_logical,
-            remote_dcp_size=remote_dcp_size,
-        )
-        transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
-
-        self.tp_mappings[engine_id] = compute_tp_mapping(
-            transfer_topology=transfer_topo,
-            remote_tp_size=remote_tp_size,
-            group_spec_types=self._group_spec_types,
-            remote_dcp_size=remote_dcp_size,
-        )
-
-        remote_agent_name = self.nixl_wrapper.add_remote_agent(
-            nixl_agent_meta.agent_metadata
-        )
 
         # Create dst descs and xfer side handles. TP workers have same #blocks
         # so we only register once per engine_id.
@@ -2707,27 +2719,17 @@ class NixlBaseConnectorWorker:
         # remote:               | 0| 1| 2| 3| 4| 5| 6| 7| 8| 9|10|11|12|
         # local origin:|          0|          1|          8|         12|
         # local mapped:| 0| 1| 2| 3| 4| 5| 6| 7| 8| 9|10|11|12|13|14|15|
-        block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
-
         if engine_id not in self.dst_num_blocks:
             num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
-            self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-            self.dst_region_num_blocks[engine_id] = (
-                nixl_agent_meta.region_num_blocks
-                or [nixl_agent_meta.num_blocks] * num_remote_regions
-            )
             remote_region_group_ids = nixl_agent_meta.region_group_ids or (
                 self.region_group_ids
                 if len(self.region_group_ids) == num_remote_regions
                 else [0] * num_remote_regions
             )
-            self.dst_region_group_ids[engine_id] = remote_region_group_ids
-            self.dst_uses_region_group_mapping[engine_id] = (
-                len(set(self.dst_region_group_ids[engine_id])) > 1
-            )
-            self.dst_region_mem_types[engine_id] = (
-                nixl_agent_meta.region_mem_types
-                or [self.nixl_memory_type] * num_remote_regions
+            self._register_remote_region_metadata(
+                engine_id,
+                nixl_agent_meta,
+                remote_region_group_ids,
             )
 
         # Keep track of remote agent kv caches base addresses.
@@ -2738,18 +2740,12 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
 
-        # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
-        # this is the ratio between the two sizes.
-        tp_ratio = transfer_topo.tp_ratio(remote_tp_size)
-
         logger.debug(
             "Registering remote agent (%s, rank %s) memory regions with tp_ratio %s",
             engine_id,
             remote_tp_rank,
             tp_ratio,
         )
-
-        plan = self.tp_mappings[engine_id]
 
         ### (Optional) Register a local handler at the remote engine's block
         ### granularity (remote/prefill blocks smaller than local).
