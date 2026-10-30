@@ -9,6 +9,7 @@ import numpy as np
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    LayerRoute,
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
@@ -141,6 +142,32 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         deadline = blocks_expiry_time - clock_offset
         return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
 
+    def _align_layer_block_ids(
+        self,
+        route: LayerRoute,
+        local_ids: list[int],
+        remote_ids: list[int],
+        block_size_ratio: int,
+        remote_physical_blocks_per_logical: int,
+    ) -> tuple[list[int], list[int]]:
+        if not local_ids:
+            return [], []
+        if route.is_ssm:
+            matched = min(len(local_ids), len(remote_ids))
+            return local_ids[-matched:], remote_ids[-matched:]
+
+        if remote_physical_blocks_per_logical > 1:
+            remote_ids = self.get_mapped_blocks(
+                np.asarray(remote_ids), remote_physical_blocks_per_logical
+            ).tolist()
+
+        if block_size_ratio > 1:
+            local_ids = self.get_mapped_blocks(
+                np.asarray(local_ids), block_size_ratio
+            ).tolist()
+        matched = min(len(local_ids), len(remote_ids))
+        return local_ids[:matched], remote_ids[-matched:]
+
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
@@ -178,7 +205,56 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids = meta.local_physical_block_ids
         remote_region_groups = self.dst_region_group_ids[engine_id]
         local_region_groups = self.region_group_ids or remote_region_groups
-        if not local_block_ids:
+        if engine_id in self._layer_routes:
+            routes = self._layer_routes[engine_id]
+            block_size_ratio = self.transfer_topo.block_size_ratio(
+                remote_info.remote_block_size
+            )
+            local_layer_ids: list[list[int]] = []
+            remote_layer_ids: list[list[int]] = []
+            for route in routes:
+                local_route_ids, remote_route_ids = self._align_layer_block_ids(
+                    route,
+                    list(meta.local_physical_block_ids[route.local_group_id]),
+                    list(meta.remote.block_ids[route.remote_group_id]),
+                    block_size_ratio,
+                    remote_info.remote_physical_blocks_per_logical,
+                )
+                local_layer_ids.append(local_route_ids)
+                remote_layer_ids.append(remote_route_ids)
+            remote_logical_blocks = (
+                self.dst_num_blocks[engine_id]
+                // remote_info.remote_physical_blocks_per_logical
+            )
+            local_desc_ids = self._compute_layer_desc_ids(
+                engine_id,
+                routes,
+                local_layer_ids,
+                False,
+                block_size_ratio,
+                remote_logical_blocks,
+            )
+            remote_desc_ids = self._compute_layer_desc_ids(
+                engine_id,
+                routes,
+                remote_layer_ids,
+                True,
+                block_size_ratio,
+                remote_logical_blocks,
+            )
+            read_specs = [
+                ReadSpec(
+                    remote_rank=rank,
+                    local_block_ids=local_layer_ids,
+                    remote_block_ids=remote_layer_ids,
+                    layer_routed=True,
+                    local_desc_ids=local_desc_ids,
+                    remote_desc_ids=remote_desc_ids,
+                )
+                for rank in plan.all_source_ranks
+            ]
+            meta.region_blocks_to_zero = ()
+        elif not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
             # _read_blocks so its existing cache-hit notification path runs.
             read_specs = [
@@ -417,7 +493,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
         )
-        if block_size_ratio > 1:
+        if not read_spec.layer_routed and block_size_ratio > 1:
             if read_spec.block_ids_by_region:
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
@@ -466,7 +542,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._recving_transfers.setdefault(request_id, [])
             return True
 
-        if not read_spec.block_ids_by_region:
+        if not read_spec.layer_routed and not read_spec.block_ids_by_region:
             assert (
                 len(remote_block_ids)
                 == len(local_block_ids)
@@ -488,41 +564,50 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
 
-        # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.dst_region_group_ids.get(dst_engine_id) or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self.dst_uses_region_group_mapping[dst_engine_id]
-            ),
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.region_group_ids or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self._uses_region_group_mapping
-            ),
-        )
+        if read_spec.local_desc_ids is None:
+            remote_block_descs_ids = self._compute_desc_ids(
+                block_ids=remote_block_ids,
+                dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+                block_size_ratio=None,
+                physical_blocks_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
+                region_num_blocks=(
+                    self.dst_region_num_blocks.get(dst_engine_id) or None
+                ),
+                region_group_ids=(
+                    list(range(self.num_regions))
+                    if read_spec.block_ids_by_region
+                    else (self.dst_region_group_ids.get(dst_engine_id) or None)
+                ),
+                uses_region_group_mapping=(
+                    self.num_regions > 1
+                    if read_spec.block_ids_by_region
+                    else self.dst_uses_region_group_mapping[dst_engine_id]
+                ),
+            )
+            local_block_descs_ids = self._compute_desc_ids(
+                block_ids=local_block_ids,
+                dst_num_blocks=self.dst_num_blocks[self.engine_id],
+                block_size_ratio=block_size_ratio,
+                physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+                region_num_blocks=(
+                    self.dst_region_num_blocks.get(self.engine_id) or None
+                ),
+                region_group_ids=(
+                    list(range(self.num_regions))
+                    if read_spec.block_ids_by_region
+                    else (self.region_group_ids or None)
+                ),
+                uses_region_group_mapping=(
+                    self.num_regions > 1
+                    if read_spec.block_ids_by_region
+                    else self._uses_region_group_mapping
+                ),
+            )
+        else:
+            local_block_descs_ids = read_spec.local_desc_ids
+            remote_block_descs_ids = read_spec.remote_desc_ids
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 

@@ -27,6 +27,9 @@ class ReadSpec:
     local_block_ids: BlockIds
     remote_block_ids: BlockIds
     block_ids_by_region: bool = False
+    layer_routed: bool = False
+    local_desc_ids: np.ndarray | None = None
+    remote_desc_ids: np.ndarray | None = None
 
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
