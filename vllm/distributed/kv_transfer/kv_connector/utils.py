@@ -434,41 +434,49 @@ def get_current_attn_backend(
 
 
 def contiguous_byte_ranges(
-    src: torch.Tensor, dst: torch.Tensor
+    local: torch.Tensor, remote: torch.Tensor
 ) -> list[tuple[int, int, int]]:
     """Split two same-shape views into byte ranges contiguous in both.
 
-    Pairs views returned by ``KVCacheSpec.slice_for_tp_transfer`` on either
-    side, which may differ in physical layout. Returns ``(src_offset,
-    dst_offset, num_bytes)`` per range, with offsets in bytes from the start of
-    each view's storage, in row-major order of the logical shape.
+    Pairs views returned by ``KVCacheSpec.slice_for_tp_transfer``, which may
+    differ in physical layout. Returns ``(local_offset, remote_offset,
+    num_bytes)`` per range, with offsets in bytes from the start of each
+    view's storage, in row-major order of the logical shape.
     """
-    if src.shape != dst.shape or src.element_size() != dst.element_size():
+    if local.shape != remote.shape or (local.element_size() != remote.element_size()):
         raise ValueError(
-            f"Cannot pair {tuple(src.shape)} x {src.element_size()}B with "
-            f"{tuple(dst.shape)} x {dst.element_size()}B."
+            f"Cannot pair {tuple(local.shape)} x {local.element_size()}B with "
+            f"{tuple(remote.shape)} x {remote.element_size()}B."
         )
-    if src.numel() == 0:
+    if local.numel() == 0:
         return []
-    elem = src.element_size()
+    elem = local.element_size()
     dims = [
-        (size, s, d)
-        for size, s, d in zip(src.shape, src.stride(), dst.stride())
+        (size, local_stride, remote_stride)
+        for size, local_stride, remote_stride in zip(
+            local.shape, local.stride(), remote.stride()
+        )
         if size != 1
     ]
     contiguous = 1
     while dims and dims[-1][1] == contiguous and dims[-1][2] == contiguous:
         contiguous *= dims.pop()[0]
 
-    src_offsets = torch.tensor([src.storage_offset()], dtype=torch.int64, device="cpu")
-    dst_offsets = torch.tensor([dst.storage_offset()], dtype=torch.int64, device="cpu")
-    for size, s, d in dims:
+    local_offsets = torch.tensor(
+        [local.storage_offset()], dtype=torch.int64, device="cpu"
+    )
+    remote_offsets = torch.tensor(
+        [remote.storage_offset()], dtype=torch.int64, device="cpu"
+    )
+    for size, local_stride, remote_stride in dims:
         idx = torch.arange(size, dtype=torch.int64, device="cpu")
-        src_offsets = (src_offsets[:, None] + idx * s).flatten()
-        dst_offsets = (dst_offsets[:, None] + idx * d).flatten()
+        local_offsets = (local_offsets[:, None] + idx * local_stride).flatten()
+        remote_offsets = (remote_offsets[:, None] + idx * remote_stride).flatten()
     return [
-        (s * elem, d * elem, contiguous * elem)
-        for s, d in zip(src_offsets.tolist(), dst_offsets.tolist())
+        (local_offset * elem, remote_offset * elem, contiguous * elem)
+        for local_offset, remote_offset in zip(
+            local_offsets.tolist(), remote_offsets.tolist()
+        )
     ]
 
 

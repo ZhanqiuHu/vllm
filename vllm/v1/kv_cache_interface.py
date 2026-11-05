@@ -199,6 +199,38 @@ class SparseCacheRole(str, Enum):
 
 
 @dataclass(frozen=True)
+class TPPlacement:
+    """A cache's position in its TP group."""
+
+    tp_size: int
+    tp_rank: int
+
+    def __post_init__(self):
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
+        if not 0 <= self.tp_rank < self.tp_size:
+            raise ValueError("tp_rank must be in [0, tp_size)")
+
+
+@dataclass(frozen=True)
+class TPShard:
+    """One semantic piece of a cache that can move independently across TP."""
+
+    key: tuple[str | int, ...]
+    view: torch.Tensor
+    span: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class TPTransferPiece:
+    """A local and remote view of the same semantic cache shard."""
+
+    key: tuple[str | int, ...]
+    local: torch.Tensor
+    remote: torch.Tensor
+
+
+@dataclass(frozen=True)
 class KVCacheSpec:
     """A base class for specifying the KV cache format of one layer."""
 
@@ -344,7 +376,7 @@ class KVCacheSpec:
         """
         return True
 
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -354,23 +386,123 @@ class KVCacheSpec:
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Views of ``cache`` moved between this rank and another TP rank.
+    ) -> list[TPShard]:
+        """Semantic shards of ``cache`` shared with another TP rank.
 
         ``cache`` is this rank's ``[B, H, N, C]`` view of one layer's cache,
-        real or on the meta device. The other rank's call, given this rank as
-        its peer and the opposite ``receiving``, returns views of the same
-        shapes in the same order, so the two lists pair up for transfer.
-        Empty when the pair moves nothing, so the other rank is not a source
-        (or destination) of this one.
+        real or on the meta device. The other rank's call, given this rank as its
+        peer and the opposite ``receiving``, returns shards with the same keys,
+        so the two sides pair by key instead of list order.
         """
         if tp_size == other_tp_size and tp_rank == other_tp_rank:
-            return [cache]
+            return [TPShard(("opaque",), cache)]
         if tp_size == other_tp_size:
             return []
         raise NotImplementedError(
             f"{type(self).__name__} does not support heterogeneous TP transfers."
         )
+
+    def slice_for_tp_transfer(
+        self,
+        local_cache: torch.Tensor,
+        local_tp: TPPlacement,
+        remote_spec: KVCacheSpec,
+        remote_cache: torch.Tensor,
+        remote_tp: TPPlacement,
+        *,
+        receiving: bool,
+    ) -> list[TPTransferPiece]:
+        """Build transfer pieces by pairing semantic shards from both endpoints.
+
+        ``receiving`` is relative to the caller: ``True`` means this cache is
+        the destination and ``False`` means the peer cache is the destination.
+        The returned views preserve endpoint identity rather than transfer
+        direction; callers map them to READ or WRITE operations.
+        """
+        local_shards = self._slice_for_tp_transfer(
+            local_cache,
+            local_tp.tp_size,
+            local_tp.tp_rank,
+            remote_spec,
+            remote_tp.tp_size,
+            remote_tp.tp_rank,
+            receiving=receiving,
+        )
+        remote_shards = remote_spec._slice_for_tp_transfer(
+            remote_cache,
+            remote_tp.tp_size,
+            remote_tp.tp_rank,
+            self,
+            local_tp.tp_size,
+            local_tp.tp_rank,
+            receiving=not receiving,
+        )
+        remote_by_key: dict[tuple[str | int, ...], list[TPShard]] = {}
+        for shard in remote_shards:
+            remote_by_key.setdefault(shard.key, []).append(shard)
+
+        pieces: list[TPTransferPiece] = []
+        used_remote_keys = set()
+        for local_shard in local_shards:
+            remote_shards_for_key = remote_by_key.get(local_shard.key)
+            if not remote_shards_for_key:
+                raise ValueError(
+                    f"Local TP transfer shard key {local_shard.key!r} "
+                    "has no remote counterpart."
+                )
+            if local_shard.span is None:
+                if len(remote_shards_for_key) != 1:
+                    raise ValueError(
+                        f"TP transfer shard key {local_shard.key!r} is ambiguous."
+                    )
+                remote_shard = remote_shards_for_key[0]
+                local_view = local_shard.view
+                remote_view = remote_shard.view
+            else:
+                overlapping = []
+                local_start, local_stop = local_shard.span
+                for remote_shard in remote_shards_for_key:
+                    if remote_shard.span is None:
+                        continue
+                    remote_start, remote_stop = remote_shard.span
+                    start = max(local_start, remote_start)
+                    stop = min(local_stop, remote_stop)
+                    if start < stop:
+                        overlapping.append((remote_shard, start, stop))
+                if len(overlapping) != 1:
+                    raise ValueError(
+                        f"TP transfer shard key {local_shard.key!r} has "
+                        f"{len(overlapping)} overlapping remote shards."
+                    )
+                remote_shard, start, stop = overlapping[0]
+                local_view = local_shard.view[
+                    :, start - local_shard.span[0] : stop - local_shard.span[0]
+                ]
+                remote_view = remote_shard.view[
+                    :, start - remote_shard.span[0] : stop - remote_shard.span[0]
+                ]
+            used_remote_keys.add(local_shard.key)
+            if local_view.shape != remote_view.shape:
+                raise ValueError(
+                    f"TP transfer shard {local_shard.key!r} is not paired: "
+                    f"local shape {tuple(local_view.shape)} != remote "
+                    f"shape {tuple(remote_view.shape)}."
+                )
+            pieces.append(
+                TPTransferPiece(
+                    key=local_shard.key,
+                    local=local_view,
+                    remote=remote_view,
+                )
+            )
+
+        unpaired = remote_by_key.keys() - used_remote_keys
+        if unpaired:
+            raise ValueError(
+                "Remote TP transfer shard keys have no local counterparts: "
+                f"{sorted(unpaired)!r}."
+            )
+        return pieces
 
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
@@ -612,7 +744,7 @@ class AttentionSpec(KVCacheSpec):
 
     # NOTE: KV-head placement across TP belongs to a GQA spec subclass; it
     # moves there (or goes away) with the spec split of RFC #42449 (#61452).
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -622,7 +754,7 @@ class AttentionSpec(KVCacheSpec):
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
+    ) -> list[TPShard]:
         """Narrow ``cache`` to the KV heads moved between the two ranks.
 
         A cache whose dim 1 is not its KV heads (custom ``num_head_slots``)
@@ -638,17 +770,36 @@ class AttentionSpec(KVCacheSpec):
             pairs = [(h, h * other_heads // heads) for h in range(heads)]
         else:
             pairs = [(h * heads // other_heads, h) for h in range(other_heads)]
-        moved = [
-            ours % n
+        moved_pairs = [
+            (ours % n, theirs % other_n)
             for ours, theirs in pairs
             if ours // n == tp_rank and theirs // other_n == other_tp_rank
         ]
-        if not moved:
+        if not moved_pairs:
             return []
         if cache.shape[1] == self.num_kv_heads:
-            return [cache[:, moved[0] : moved[-1] + 1]]
+            moved = [ours for ours, _ in moved_pairs]
+            span = None
+            if self.max_tp_shards is not None and other_spec.max_tp_shards is not None:
+                head_start = (
+                    tp_rank
+                    * min(tp_size, self.max_tp_shards)
+                    // tp_size
+                    * self.num_kv_heads
+                )
+                span = (
+                    head_start + moved[0],
+                    head_start + moved[-1] + 1,
+                )
+            return [
+                TPShard(
+                    ("attention", "heads"),
+                    cache[:, moved[0] : moved[-1] + 1],
+                    span,
+                )
+            ]
         if self.num_kv_heads == other_spec.num_kv_heads:
-            return [cache]
+            return [TPShard(("attention", "packed"), cache)]
         raise NotImplementedError(
             f"{type(self).__name__} with {self.num_head_slots} head slots cannot "
             "be sliced by KV head."
@@ -1211,7 +1362,7 @@ class MambaSpec(KVCacheSpec):
         same-TP transfers are supported. Mamba backends override this."""
         return None
 
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -1221,7 +1372,7 @@ class MambaSpec(KVCacheSpec):
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
+    ) -> list[TPShard]:
         """Narrow each sharded segment of each state to the rows both ranks hold.
 
         ``cache`` is the layer's ``[B, 1, 1, C]`` int8 page view (see
@@ -1233,14 +1384,20 @@ class MambaSpec(KVCacheSpec):
             # sender at its position.
             if receiving:
                 source = tp_rank * other_tp_size // tp_size
-                return [cache] if other_tp_rank == source else []
+                return (
+                    [TPShard(("mamba", "replicated"), cache)]
+                    if other_tp_rank == source
+                    else []
+                )
             return (
-                [cache] if tp_rank == other_tp_rank * tp_size // other_tp_size else []
+                [TPShard(("mamba", "replicated"), cache)]
+                if tp_rank == other_tp_rank * tp_size // other_tp_size
+                else []
             )
         segments = self._tp_segments()
         other_segments = other_spec._tp_segments()
         if segments is None or other_segments is None:
-            return super().slice_for_tp_transfer(
+            return super()._slice_for_tp_transfer(
                 cache,
                 tp_size,
                 tp_rank,
@@ -1250,13 +1407,15 @@ class MambaSpec(KVCacheSpec):
                 receiving=receiving,
             )
         pages = cache.flatten(1)
-        views: list[torch.Tensor] = []
+        shards: list[TPShard] = []
         offset = 0
-        for shape, dtype, sizes, other_sizes in zip(
-            self.shapes, self.dtypes, segments, other_segments, strict=True
+        for state_index, (shape, dtype, sizes, other_sizes) in enumerate(
+            zip(self.shapes, self.dtypes, segments, other_segments, strict=True)
         ):
             row_bytes = prod(shape[1:]) * get_dtype_size(dtype)
-            for size, other_size in zip(sizes, other_sizes, strict=True):
+            for segment_index, (size, other_size) in enumerate(
+                zip(sizes, other_sizes, strict=True)
+            ):
                 if size * tp_size != other_size * other_tp_size:
                     raise NotImplementedError(
                         f"{type(self).__name__} segment of {size} rows at TP "
@@ -1267,9 +1426,14 @@ class MambaSpec(KVCacheSpec):
                 stop = min((tp_rank + 1) * size, (other_tp_rank + 1) * other_size)
                 if start < stop:
                     first = offset + (start - tp_rank * size) * row_bytes
-                    views.append(pages[:, first : first + (stop - start) * row_bytes])
+                    shards.append(
+                        TPShard(
+                            ("mamba", state_index, segment_index),
+                            pages[:, first : first + (stop - start) * row_bytes],
+                        )
+                    )
                 offset += size * row_bytes
-        return views
+        return shards
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
