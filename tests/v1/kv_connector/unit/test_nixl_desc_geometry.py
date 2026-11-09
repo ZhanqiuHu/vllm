@@ -35,7 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 from vllm.v1.attention.backends.gdn_attn import GDNSpec
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -465,6 +464,10 @@ def _register_overlaid_mla_worker(
         ],
         kv_cache_groups=groups,
     )
+    worker._group_specs = tuple(g.kv_cache_spec for g in groups)
+    worker._group_spec_types = tuple(type(g.kv_cache_spec) for g in groups)
+    worker._physical_blocks_per_group = [1] * len(groups)
+    worker._remote_group_specs = {}
 
     with (
         patch.object(bw, "TransferTopology", return_value=MagicMock()),
@@ -775,7 +778,8 @@ def _make_remote_meta(
         base = worker.kv_caches_base_addr[worker.engine_id][0][region]
         tensor = next(i for i, (lo, hi) in enumerate(tensor_ranges) if lo <= base < hi)
         base_addrs.append(0x10_000_000 * (tensor + 1))
-        if not bw._is_ssm_spec(worker._group_spec_types[group_by_layer[names[0]]]):
+        group = group_by_layer[names[0]]
+        if worker._group_specs[group].block_size_for_transfer_lcm() is not None:
             # Per-token block bytes are TP-independent for MLA hybrids.
             block_lens.append(
                 worker.block_len_per_layer[region]
@@ -809,10 +813,10 @@ def _make_remote_meta(
         region_members=worker.region_members,
         region_group_ids=region_group_ids,
         layer_group_ids=layer_group_ids,
-        layer_num_kv_heads={
-            name: spec.num_kv_heads
+        peer_spec_fields_by_layer={
+            name: dict(spec.peer_handshake_fields())
             for name, spec in worker._layer_specs.items()
-            if isinstance(spec, AttentionSpec)
+            if spec.peer_handshake_fields()
         },
     )
 
@@ -1499,12 +1503,23 @@ def test_csa_linear_ple_moves_whole_from_one_rank(ple_page_size):
     """Pulling from two P ranks, the replicated PLE block is read whole from one
     of them, even when wider than the block it shares a base with, while the
     sharded Mamba state is read half from each."""
+    from vllm.v1.kv_cache_interface import RemoteTransferInfo
+
     worker = _make_csa_linear_ple_worker(ple_page_size=ple_page_size)
     metadata = msgspec.msgpack.decode(
         worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
     )
     pairs = worker._pair_regions(metadata)
     worker._select_remote_regions(metadata, pairs.remote_regions)
+    # This test reuses local handshake meta as the "peer"; inject the peer bag
+    # directly (register_remote_engine rejects engine_id == local).
+    assert worker.transfer_topo is not None
+    worker.transfer_topo._engines[(metadata.engine_id, 0)] = RemoteTransferInfo(
+        tp_size=2,
+        block_size=metadata.block_size,
+        block_len=metadata.block_lens[0],
+        dcp_size=1,
+    )
     regions = list(zip(pairs.local, pairs.group, pairs.remote))
     ranges = dict(
         zip(pairs.group, worker._tp_byte_ranges(metadata, regions, 2, 1, 1, True))

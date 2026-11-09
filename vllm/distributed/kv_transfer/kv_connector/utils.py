@@ -21,7 +21,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, iter_layer_specs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    RemoteTransferInfo,
+    iter_layer_specs,
+)
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
@@ -33,6 +38,9 @@ EngineId = str
 # block ids as returned by the hybrid KV cache manager. list[list[int]] are allow
 # mutability and are for connector internal use only.
 BlockIds = tuple[list[int], ...] | list[list[int]]
+
+# Peer session bag used by TransferTopology (was EngineTransferInfo).
+EngineTransferInfo = RemoteTransferInfo
 
 
 def clip_ssm_state_blocks(blocks: list[int], num_spec_blocks: int) -> list[int]:
@@ -434,76 +442,50 @@ def get_current_attn_backend(
 
 
 def contiguous_byte_ranges(
-    src: torch.Tensor, dst: torch.Tensor
+    local: torch.Tensor, remote: torch.Tensor
 ) -> list[tuple[int, int, int]]:
     """Split two same-shape views into byte ranges contiguous in both.
 
-    Pairs views returned by ``KVCacheSpec.slice_for_tp_transfer`` on either
-    side, which may differ in physical layout. Returns ``(src_offset,
-    dst_offset, num_bytes)`` per range, with offsets in bytes from the start of
-    each view's storage, in row-major order of the logical shape.
+    Pairs views returned by ``KVCacheSpec.slice_for_tp_transfer``, which may
+    differ in physical layout. Returns ``(local_offset, remote_offset,
+    num_bytes)`` per range, with offsets in bytes from the start of each
+    view's storage, in row-major order of the logical shape.
     """
-    if src.shape != dst.shape or src.element_size() != dst.element_size():
+    if local.shape != remote.shape or (local.element_size() != remote.element_size()):
         raise ValueError(
-            f"Cannot pair {tuple(src.shape)} x {src.element_size()}B with "
-            f"{tuple(dst.shape)} x {dst.element_size()}B."
+            f"Cannot pair {tuple(local.shape)} x {local.element_size()}B with "
+            f"{tuple(remote.shape)} x {remote.element_size()}B."
         )
-    if src.numel() == 0:
+    if local.numel() == 0:
         return []
-    elem = src.element_size()
+    elem = local.element_size()
     dims = [
-        (size, s, d)
-        for size, s, d in zip(src.shape, src.stride(), dst.stride())
+        (size, local_stride, remote_stride)
+        for size, local_stride, remote_stride in zip(
+            local.shape, local.stride(), remote.stride()
+        )
         if size != 1
     ]
     contiguous = 1
     while dims and dims[-1][1] == contiguous and dims[-1][2] == contiguous:
         contiguous *= dims.pop()[0]
 
-    src_offsets = torch.tensor([src.storage_offset()], dtype=torch.int64, device="cpu")
-    dst_offsets = torch.tensor([dst.storage_offset()], dtype=torch.int64, device="cpu")
-    for size, s, d in dims:
+    local_offsets = torch.tensor(
+        [local.storage_offset()], dtype=torch.int64, device="cpu"
+    )
+    remote_offsets = torch.tensor(
+        [remote.storage_offset()], dtype=torch.int64, device="cpu"
+    )
+    for size, local_stride, remote_stride in dims:
         idx = torch.arange(size, dtype=torch.int64, device="cpu")
-        src_offsets = (src_offsets[:, None] + idx * s).flatten()
-        dst_offsets = (dst_offsets[:, None] + idx * d).flatten()
+        local_offsets = (local_offsets[:, None] + idx * local_stride).flatten()
+        remote_offsets = (remote_offsets[:, None] + idx * remote_stride).flatten()
     return [
-        (s * elem, d * elem, contiguous * elem)
-        for s, d in zip(src_offsets.tolist(), dst_offsets.tolist())
+        (local_offset * elem, remote_offset * elem, contiguous * elem)
+        for local_offset, remote_offset in zip(
+            local_offsets.tolist(), remote_offsets.tolist()
+        )
     ]
-
-
-# ---- Per-engine transfer info ----
-
-
-@dataclass(frozen=True)
-class EngineTransferInfo:
-    """Common per-remote-engine transfer state, computed at handshake.
-
-    Stored per ``(engine_id, pp_rank)`` inside ``TransferTopology._engines``.
-    """
-
-    remote_tp_size: int
-
-    remote_block_len: int
-    """Block length (bytes)"""
-
-    remote_block_size: int
-    """Tokens per block."""
-
-    remote_physical_blocks_per_logical: int
-    """Physical blocks per logical block."""
-
-    remote_pp_rank: int = 0
-    """Remote producer PP rank for this engine."""
-
-    start_layer: int = 0
-    """Global index of the first layer owned by this PP rank."""
-
-    end_layer: int = 0
-    """Exclusive global index after the last layer owned by this PP rank."""
-
-    remote_dcp_size: int = 1
-    """Remote decode context parallel size."""
 
 
 # ---- Transfer topology ----
@@ -511,7 +493,7 @@ class EngineTransferInfo:
 
 @dataclass
 class TransferTopology:
-    """Single source of truth for local TP identity and per-engine remote info."""
+    """Local TP identity plus per-peer ``RemoteTransferInfo`` session bags."""
 
     tp_rank: int
     tp_size: int
@@ -527,7 +509,7 @@ class TransferTopology:
     def __post_init__(self):
         self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
-        self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
+        self._engines: dict[tuple[EngineId, int], RemoteTransferInfo] = {}
 
     # ============================================================
     # Engine registration
@@ -536,8 +518,8 @@ class TransferTopology:
     def register_remote_engine(
         self,
         remote_engine_id: EngineId,
-        info: EngineTransferInfo,
-    ) -> EngineTransferInfo:
+        info: RemoteTransferInfo,
+    ) -> RemoteTransferInfo:
         """Register a remote engine, unifying worker dicts state.
 
         The caller (worker) is responsible for computing the info via
@@ -547,7 +529,7 @@ class TransferTopology:
             f"Cannot register local engine {self.engine_id} as remote. "
             f"Local identity is set via __init__ params."
         )
-        engine_key = (remote_engine_id, info.remote_pp_rank)
+        engine_key = (remote_engine_id, info.pp_rank)
         if engine_key in self._engines:
             return self._engines[engine_key]
         self._engines[engine_key] = info
@@ -555,7 +537,7 @@ class TransferTopology:
 
     def get_engine_info(
         self, remote_engine_id: EngineId, remote_pp_rank: int = 0
-    ) -> EngineTransferInfo:
+    ) -> RemoteTransferInfo:
         return self._engines[(remote_engine_id, remote_pp_rank)]
 
     def unregister_remote_engine(self, remote_engine_id: EngineId) -> None:
@@ -610,7 +592,7 @@ class TransferTopology:
         number of TP workers being greater than the number of KV heads.
         """
         return (
-            self._engines[(remote_engine_id, remote_pp_rank)].remote_tp_size
+            self._engines[(remote_engine_id, remote_pp_rank)].tp_size
             > self.total_num_kv_heads
         )
 
@@ -697,7 +679,7 @@ class TransferTopology:
         multiple remote ranks.
         """
         info = self._engines[(remote_engine_id, remote_pp_rank)]
-        tp_ratio = self.tp_ratio(info.remote_tp_size)
+        tp_ratio = self.tp_ratio(info.tp_size)
         if tp_ratio > 0:
             return [self.tp_rank // tp_ratio]
         # remote TP > local TP: read from |tp_ratio| remote workers
@@ -709,13 +691,13 @@ class TransferTopology:
         info = self._engines[(remote_engine_id, remote_pp_rank)]
         return (
             f"TransferTopology("
-            f"tp_ratio={self.tp_ratio(info.remote_tp_size)}, "
+            f"tp_ratio={self.tp_ratio(info.tp_size)}, "
             f"num_kv_heads={self.total_num_kv_heads if not self.is_mla else 1}, "
             f"local_tp={self.tp_size}, "
-            f"remote_tp={info.remote_tp_size}, "
+            f"remote_tp={info.tp_size}, "
             f"remote_pp={remote_pp_rank}, "
             f"local_dcp={self.dcp_size}, "
-            f"remote_dcp={info.remote_dcp_size}, "
+            f"remote_dcp={info.dcp_size}, "
             f"local_rank={self.tp_rank}, "
-            f"remote_block_len={info.remote_block_len})"
+            f"remote_block_len={info.block_len})"
         )

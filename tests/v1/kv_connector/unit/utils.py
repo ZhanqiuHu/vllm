@@ -46,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
+    TPPlacement,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -750,15 +751,18 @@ def transfer_kv(
     dst_raw, dst_view = dst_cache
     written = 0
     for src_rank, (src_raw, src_view) in enumerate(src_caches):
-        dst_slices = dst_spec.slice_for_tp_transfer(
-            dst_view, dst_tp, dst_rank, src_spec, src_tp, src_rank, receiving=True
+        paired_views = dst_spec.slice_for_tp_transfer(
+            dst_view,
+            TPPlacement(dst_tp, dst_rank),
+            src_spec,
+            src_view,
+            TPPlacement(src_tp, src_rank),
+            receiving=True,
         )
-        src_slices = src_spec.slice_for_tp_transfer(
-            src_view, src_tp, src_rank, dst_spec, dst_tp, dst_rank, receiving=False
-        )
-        assert len(src_slices) == len(dst_slices)
-        for src, dst in zip(src_slices, dst_slices):
-            for src_off, dst_off, size in contiguous_byte_ranges(src, dst):
+        for paired in paired_views:
+            for dst_off, src_off, size in contiguous_byte_ranges(
+                paired.local, paired.remote
+            ):
                 dst_raw[dst_off : dst_off + size] = src_raw[src_off : src_off + size]
                 written += size
     assert written == dst_raw.numel()

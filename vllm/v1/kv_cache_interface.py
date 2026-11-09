@@ -6,13 +6,13 @@ from __future__ import annotations
 import copy
 import math
 from collections import Counter
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Self, TypeVar
 
 import torch
 
@@ -25,11 +25,46 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
     from vllm.v1.attention.backend import MultipleOf
 
 logger = init_logger(__name__)
 
 _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
+
+
+# ---------------------------------------------------------------------------
+# Engine-level transfer info (data only; consumed by KVCacheSpec transfer APIs)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LocalTransferInfo:
+    """This engine's transfer-session facts (not cache-type policy)."""
+
+    engine_id: str
+    tp_size: int
+    tp_rank: int
+    block_size: int
+    """Engine token lattice (tokens per block) used for P/D page pairing."""
+    dcp_size: int = 1
+
+
+@dataclass(frozen=True)
+class RemoteTransferInfo:
+    """Peer engine's transfer-session facts (not cache-type policy)."""
+
+    tp_size: int
+    block_size: int
+    """Peer's engine token lattice (tokens per block)."""
+    block_len: int
+    """Bytes per registered peer block (first region; topology helper)."""
+    dcp_size: int = 1
+    pp_rank: int = 0
+    start_layer: int = 0
+    end_layer: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +234,38 @@ class SparseCacheRole(str, Enum):
 
 
 @dataclass(frozen=True)
+class TPPlacement:
+    """A cache's position in its TP group."""
+
+    tp_size: int
+    tp_rank: int
+
+    def __post_init__(self):
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
+        if not 0 <= self.tp_rank < self.tp_size:
+            raise ValueError("tp_rank must be in [0, tp_size)")
+
+
+@dataclass(frozen=True)
+class TPShard:
+    """One semantic piece of a cache that can move independently across TP."""
+
+    key: tuple[str | int, ...]
+    view: torch.Tensor
+    span: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class TPTransferPiece:
+    """A local and remote view of the same semantic cache shard."""
+
+    key: tuple[str | int, ...]
+    local: torch.Tensor
+    remote: torch.Tensor
+
+
+@dataclass(frozen=True)
 class KVCacheSpec:
     """A base class for specifying the KV cache format of one layer."""
 
@@ -344,7 +411,7 @@ class KVCacheSpec:
         """
         return True
 
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -354,23 +421,212 @@ class KVCacheSpec:
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Views of ``cache`` moved between this rank and another TP rank.
+    ) -> list[TPShard]:
+        """Semantic shards of ``cache`` shared with another TP rank.
 
-        ``cache`` is this rank's ``[B, H, N, C]`` view of one layer's cache,
-        real or on the meta device. The other rank's call, given this rank as
-        its peer and the opposite ``receiving``, returns views of the same
-        shapes in the same order, so the two lists pair up for transfer.
-        Empty when the pair moves nothing, so the other rank is not a source
-        (or destination) of this one.
+        ``cache`` is this rank's registered page view (Attention typically
+        ``[B, H, N, C]``; Mamba ``[B, 1, 1, C]``), real or on the meta device.
+        The other rank's call, given this rank as its peer and the opposite
+        ``receiving``, returns shards with the same keys, so the two sides
+        pair by key instead of list order. Empty when the pair moves nothing.
         """
         if tp_size == other_tp_size and tp_rank == other_tp_rank:
-            return [cache]
+            return [TPShard(("opaque",), cache)]
         if tp_size == other_tp_size:
             return []
         raise NotImplementedError(
             f"{type(self).__name__} does not support heterogeneous TP transfers."
         )
+
+    def peer_handshake_fields(self) -> Mapping[str, Any]:
+        """Cache-type fields this layer contributes to peer handshake metadata.
+
+        Default: nothing. Subclasses add only fields their type needs (e.g.
+        Attention publishes ``num_kv_heads``). Connectors aggregate these
+        without ``isinstance`` on concrete spec types.
+        """
+        return {}
+
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> KVCacheSpec:
+        """Rebuild the peer ``KVCacheSpec`` used as ``other_spec`` for TP slice.
+
+        ``handshake`` is peer engine handshake metadata. Typed as
+        ``NixlAgentMetadata`` under ``TYPE_CHECKING`` only (no runtime import).
+        Overrides read only the fields their cache type needs. Default: peer
+        is this spec.
+        """
+        return self
+
+    def block_size_for_transfer_lcm(self) -> int | None:
+        """Token page size for the engine transfer ``block_size`` LCM, or opt out.
+
+        Default: participate with ``self.block_size``. Mamba / CircularBuffer
+        return ``None`` (same outcome as today's NIXL type-name LCM skip).
+        """
+        return self.block_size
+
+    def apply_registered_geometry(self, *, rows_per_manager_block: int = 1) -> Self:
+        """Apply connector-measured registration geometry. Default: unchanged.
+
+        ``rows_per_manager_block`` is ``cache.shape[0] // num_manager_blocks``
+        (max over layers in the group). Types that subdivide a manager block
+        store it; others ignore it.
+        """
+        return self
+
+    def convert_manager_block_ids_to_transfer_unit_ids(
+        self,
+        manager_block_ids: Sequence[int],
+    ) -> list[int]:
+        """Manager block ids → registered transfer-unit ids. Default: identity."""
+        return list(manager_block_ids)
+
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
+    ) -> tuple[list[int], list[int]]:
+        """Map request block ids using general local/remote engine info.
+
+        Default: identity — this cache type does not nest pages across engines
+        (e.g. Mamba). Attention overrides using ``local.block_size`` /
+        ``remote.block_size``.
+        """
+        return list(local_block_ids), list(remote_block_ids)
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """Align decode/prefill unit lists after a prefix-cache hit.
+
+        Default: end-trim prefill to the decode count. Token-lattice Attention
+        and state-slot Mamba override when their trim rules differ.
+        ``*_units_per_manager`` are per-group registration geometry (not an
+        engine-wide Attention max).
+        """
+        del decode_units_per_manager, prefill_units_per_manager
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        if len(decode) < len(prefill):
+            return decode, prefill[-len(decode) :]
+        return decode, prefill
+
+    def slice_for_tp_transfer(
+        self,
+        local_cache: torch.Tensor,
+        local_tp: TPPlacement,
+        remote_spec: KVCacheSpec,
+        remote_cache: torch.Tensor,
+        remote_tp: TPPlacement,
+        *,
+        receiving: bool,
+    ) -> list[TPTransferPiece]:
+        """Build transfer pieces by pairing semantic shards from both endpoints.
+
+        ``receiving`` is relative to the caller: ``True`` means this cache is
+        the destination and ``False`` means the peer cache is the destination.
+        The returned views preserve endpoint identity rather than transfer
+        direction; callers map them to READ or WRITE operations.
+        """
+        local_shards = self._slice_for_tp_transfer(
+            local_cache,
+            local_tp.tp_size,
+            local_tp.tp_rank,
+            remote_spec,
+            remote_tp.tp_size,
+            remote_tp.tp_rank,
+            receiving=receiving,
+        )
+        remote_shards = remote_spec._slice_for_tp_transfer(
+            remote_cache,
+            remote_tp.tp_size,
+            remote_tp.tp_rank,
+            self,
+            local_tp.tp_size,
+            local_tp.tp_rank,
+            receiving=not receiving,
+        )
+        remote_by_key: dict[tuple[str | int, ...], list[TPShard]] = {}
+        for shard in remote_shards:
+            remote_by_key.setdefault(shard.key, []).append(shard)
+
+        pieces: list[TPTransferPiece] = []
+        used_remote_keys = set()
+        for local_shard in local_shards:
+            remote_shards_for_key = remote_by_key.get(local_shard.key)
+            if not remote_shards_for_key:
+                raise ValueError(
+                    f"Local TP transfer shard key {local_shard.key!r} "
+                    "has no remote counterpart."
+                )
+            if local_shard.span is None:
+                if len(remote_shards_for_key) != 1:
+                    raise ValueError(
+                        f"TP transfer shard key {local_shard.key!r} is ambiguous."
+                    )
+                remote_shard = remote_shards_for_key[0]
+                local_view = local_shard.view
+                remote_view = remote_shard.view
+            else:
+                overlapping = []
+                local_start, local_stop = local_shard.span
+                for remote_shard in remote_shards_for_key:
+                    if remote_shard.span is None:
+                        continue
+                    remote_start, remote_stop = remote_shard.span
+                    start = max(local_start, remote_start)
+                    stop = min(local_stop, remote_stop)
+                    if start < stop:
+                        overlapping.append((remote_shard, start, stop))
+                if len(overlapping) != 1:
+                    raise ValueError(
+                        f"TP transfer shard key {local_shard.key!r} has "
+                        f"{len(overlapping)} overlapping remote shards."
+                    )
+                remote_shard, start, stop = overlapping[0]
+                assert local_shard.span is not None and remote_shard.span is not None
+                local_view = local_shard.view[
+                    :, start - local_shard.span[0] : stop - local_shard.span[0]
+                ]
+                remote_view = remote_shard.view[
+                    :, start - remote_shard.span[0] : stop - remote_shard.span[0]
+                ]
+            used_remote_keys.add(local_shard.key)
+            if local_view.shape != remote_view.shape:
+                raise ValueError(
+                    f"TP transfer shard {local_shard.key!r} is not paired: "
+                    f"local shape {tuple(local_view.shape)} != remote "
+                    f"shape {tuple(remote_view.shape)}."
+                )
+            pieces.append(
+                TPTransferPiece(
+                    key=local_shard.key,
+                    local=local_view,
+                    remote=remote_view,
+                )
+            )
+
+        unpaired = remote_by_key.keys() - used_remote_keys
+        if unpaired:
+            raise ValueError(
+                "Remote TP transfer shard keys have no local counterparts: "
+                f"{sorted(unpaired)!r}."
+            )
+        return pieces
 
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
@@ -598,6 +854,9 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    registered_rows_per_manager_block: int = 1
+    """Registered cache rows spanned by one manager Attention block (>1 when
+    the backend splits a manager block across several registered units)."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -612,7 +871,7 @@ class AttentionSpec(KVCacheSpec):
 
     # NOTE: KV-head placement across TP belongs to a GQA spec subclass; it
     # moves there (or goes away) with the spec split of RFC #42449 (#61452).
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -622,7 +881,7 @@ class AttentionSpec(KVCacheSpec):
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
+    ) -> list[TPShard]:
         """Narrow ``cache`` to the KV heads moved between the two ranks.
 
         A cache whose dim 1 is not its KV heads (custom ``num_head_slots``)
@@ -638,21 +897,136 @@ class AttentionSpec(KVCacheSpec):
             pairs = [(h, h * other_heads // heads) for h in range(heads)]
         else:
             pairs = [(h * heads // other_heads, h) for h in range(other_heads)]
-        moved = [
-            ours % n
+        moved_pairs = [
+            (ours % n, theirs % other_n)
             for ours, theirs in pairs
             if ours // n == tp_rank and theirs // other_n == other_tp_rank
         ]
-        if not moved:
+        if not moved_pairs:
             return []
         if cache.shape[1] == self.num_kv_heads:
-            return [cache[:, moved[0] : moved[-1] + 1]]
+            moved = [ours for ours, _ in moved_pairs]
+            span = None
+            if self.max_tp_shards is not None and other_spec.max_tp_shards is not None:
+                head_start = (
+                    tp_rank
+                    * min(tp_size, self.max_tp_shards)
+                    // tp_size
+                    * self.num_kv_heads
+                )
+                span = (
+                    head_start + moved[0],
+                    head_start + moved[-1] + 1,
+                )
+            return [
+                TPShard(
+                    ("attention", "heads"),
+                    cache[:, moved[0] : moved[-1] + 1],
+                    span,
+                )
+            ]
         if self.num_kv_heads == other_spec.num_kv_heads:
-            return [cache]
+            return [TPShard(("attention", "packed"), cache)]
         raise NotImplementedError(
             f"{type(self).__name__} with {self.num_head_slots} head slots cannot "
             "be sliced by KV head."
         )
+
+    def peer_handshake_fields(self) -> Mapping[str, Any]:
+        return {"num_kv_heads": self.num_kv_heads}
+
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> AttentionSpec:
+        """Scale this Attention spec to the peer's KV heads on the handshake."""
+        fields = handshake.peer_spec_fields_by_layer.get(layer_name) or {}
+        remote_heads = fields.get("num_kv_heads")
+        if remote_heads is None or remote_heads == self.num_kv_heads:
+            return self
+        slots = self.num_head_slots and (
+            self.num_head_slots * remote_heads // self.num_kv_heads
+        )
+        return replace(self, num_kv_heads=remote_heads, num_head_slots=slots)
+
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
+    ) -> tuple[list[int], list[int]]:
+        """Expand local Attention block ids onto the peer engine page lattice.
+
+        One local engine page spans ``local.block_size // remote.block_size``
+        peer pages. Expanded ids past ``remote_block_ids`` are clipped.
+        """
+        if remote.block_size <= 0 or local.block_size % remote.block_size != 0:
+            raise ValueError(
+                f"Local block size {local.block_size} is not divisible "
+                f"by remote block size {remote.block_size}."
+            )
+        units = local.block_size // remote.block_size
+        if units == 1:
+            return list(local_block_ids), list(remote_block_ids)
+        expanded: list[int] = []
+        for local_id in local_block_ids:
+            start = local_id * units
+            expanded.extend(range(start, start + units))
+        if len(expanded) > len(remote_block_ids):
+            expanded = expanded[: len(remote_block_ids)]
+        return expanded, list(remote_block_ids)
+
+    def apply_registered_geometry(self, *, rows_per_manager_block: int = 1) -> Self:
+        if rows_per_manager_block <= 0:
+            raise ValueError(
+                "rows_per_manager_block must be positive, "
+                f"got {rows_per_manager_block}."
+            )
+        if rows_per_manager_block == self.registered_rows_per_manager_block:
+            return self
+        return replace(self, registered_rows_per_manager_block=rows_per_manager_block)
+
+    def convert_manager_block_ids_to_transfer_unit_ids(
+        self,
+        manager_block_ids: Sequence[int],
+    ) -> list[int]:
+        units = self.registered_rows_per_manager_block
+        if units == 1:
+            return list(manager_block_ids)
+        return [
+            unit
+            for manager_id in manager_block_ids
+            for unit in range(manager_id * units, manager_id * units + units)
+        ]
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """FA/token-page trim: end-trim on matching geometry, else pad-aware."""
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        num_decode, num_prefill = len(decode), len(prefill)
+        if (
+            decode_units_per_manager == prefill_units_per_manager
+            and num_decode < num_prefill
+        ):
+            return decode, prefill[-num_decode:]
+        max_padding = decode_units_per_manager + prefill_units_per_manager
+        assert abs(num_decode - num_prefill) <= max_padding, (
+            f"|{num_decode} - {num_prefill}| > {max_padding}"
+        )
+        num_blocks = min(num_decode, num_prefill)
+        return decode[:num_blocks], prefill[:num_blocks]
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1047,6 +1421,37 @@ class CircularBufferSpec(AttentionSpec):
     reads the open group's committed keys from the ring.
     """
 
+    def block_size_for_transfer_lcm(self) -> int | None:
+        return None
+
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
+    ) -> tuple[list[int], list[int]]:
+        """Ring slots are not an engine token-page lattice — never nest."""
+        del local, remote
+        return list(local_block_ids), list(remote_block_ids)
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        # Not a token-page lattice — do not inherit Attention pad/hetero trim.
+        return KVCacheSpec.align_prefix_block_ids(
+            self,
+            decode_block_ids,
+            prefill_block_ids,
+            decode_units_per_manager=decode_units_per_manager,
+            prefill_units_per_manager=prefill_units_per_manager,
+        )
+
     @property
     def block_table_token_alignment(self) -> int | None:
         return None
@@ -1179,6 +1584,36 @@ class MambaSpec(KVCacheSpec):
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
 
+    def block_size_for_transfer_lcm(self) -> int | None:
+        return None
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """Pair state-bearing slots by position; drop prefix-hit placeholders."""
+        del decode_units_per_manager, prefill_units_per_manager
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        num_decode, num_prefill = len(decode), len(prefill)
+        if num_decode == num_prefill:
+            return decode, prefill
+        # Only state-bearing slots reach here, normally just one. A longer
+        # prefill list carries earlier positions the decode side already has
+        # (prefix hit) -> take its tail; a longer decode list holds the
+        # position D recomputes itself, which gets no prefill state.
+        assert num_decode - num_prefill <= 1, (
+            f"unpairable SSM state slots, decode={num_decode} prefill={num_prefill}"
+        )
+        num_blocks = min(num_decode, num_prefill)
+        if num_decode < num_prefill:
+            return decode, prefill[-num_blocks:]
+        return decode[:num_blocks], prefill
+
     @property
     def state_content_size_bytes(self) -> int:
         return sum(
@@ -1211,7 +1646,7 @@ class MambaSpec(KVCacheSpec):
         same-TP transfers are supported. Mamba backends override this."""
         return None
 
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self,
         cache: torch.Tensor,
         tp_size: int,
@@ -1221,7 +1656,7 @@ class MambaSpec(KVCacheSpec):
         other_tp_rank: int,
         *,
         receiving: bool,
-    ) -> list[torch.Tensor]:
+    ) -> list[TPShard]:
         """Narrow each sharded segment of each state to the rows both ranks hold.
 
         ``cache`` is the layer's ``[B, 1, 1, C]`` int8 page view (see
@@ -1233,14 +1668,20 @@ class MambaSpec(KVCacheSpec):
             # sender at its position.
             if receiving:
                 source = tp_rank * other_tp_size // tp_size
-                return [cache] if other_tp_rank == source else []
+                return (
+                    [TPShard(("mamba", "replicated"), cache)]
+                    if other_tp_rank == source
+                    else []
+                )
             return (
-                [cache] if tp_rank == other_tp_rank * tp_size // other_tp_size else []
+                [TPShard(("mamba", "replicated"), cache)]
+                if tp_rank == other_tp_rank * tp_size // other_tp_size
+                else []
             )
         segments = self._tp_segments()
         other_segments = other_spec._tp_segments()
         if segments is None or other_segments is None:
-            return super().slice_for_tp_transfer(
+            return super()._slice_for_tp_transfer(
                 cache,
                 tp_size,
                 tp_rank,
@@ -1250,13 +1691,15 @@ class MambaSpec(KVCacheSpec):
                 receiving=receiving,
             )
         pages = cache.flatten(1)
-        views: list[torch.Tensor] = []
+        shards: list[TPShard] = []
         offset = 0
-        for shape, dtype, sizes, other_sizes in zip(
-            self.shapes, self.dtypes, segments, other_segments, strict=True
+        for state_index, (shape, dtype, sizes, other_sizes) in enumerate(
+            zip(self.shapes, self.dtypes, segments, other_segments, strict=True)
         ):
             row_bytes = prod(shape[1:]) * get_dtype_size(dtype)
-            for size, other_size in zip(sizes, other_sizes, strict=True):
+            for segment_index, (size, other_size) in enumerate(
+                zip(sizes, other_sizes, strict=True)
+            ):
                 if size * tp_size != other_size * other_tp_size:
                     raise NotImplementedError(
                         f"{type(self).__name__} segment of {size} rows at TP "
@@ -1267,9 +1710,31 @@ class MambaSpec(KVCacheSpec):
                 stop = min((tp_rank + 1) * size, (other_tp_rank + 1) * other_size)
                 if start < stop:
                     first = offset + (start - tp_rank * size) * row_bytes
-                    views.append(pages[:, first : first + (stop - start) * row_bytes])
+                    shards.append(
+                        TPShard(
+                            ("mamba", state_index, segment_index),
+                            pages[:, first : first + (stop - start) * row_bytes],
+                        )
+                    )
                 offset += size * row_bytes
-        return views
+        return shards
+
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> MambaSpec:
+        """Scale sharded Mamba leading dims to the peer's TP width."""
+        if local_tp_size == remote_tp_size or self.tp_replicated:
+            return self
+        shapes = tuple(
+            (shape[0] * local_tp_size // remote_tp_size, *shape[1:])
+            for shape in self.shapes
+        )
+        return replace(self, shapes=shapes, page_size_padded=None)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
