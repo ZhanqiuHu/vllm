@@ -50,8 +50,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
-            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, self._physical_blocks_per_group
+            meta.local_physical_block_ids = self._transfer_unit_ids_from_specs(
+                meta.local_block_ids, self._group_specs
             )
             assert meta.remote is not None
             # Remote block IDs are kept logical here; expanded in
@@ -183,10 +183,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         # Local ranks reading each remote rank, all of which must notify it.
         num_consumers = self.transfer_topo.dcp_consumer_count(
-            remote_info.remote_tp_size, remote_info.remote_dcp_size
+            remote_info.tp_size, remote_info.dcp_size
         )
 
-        dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
+        dcp_active = self.dcp_size > 1 or remote_info.dcp_size > 1
         local_block_ids = meta.local_physical_block_ids
         remote_region_groups = self.dst_region_group_ids[engine_id]
         local_region_groups = self.region_group_ids or remote_region_groups
@@ -217,12 +217,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     "Different NIXL cache-group layouts are only supported for "
                     "attention KV read in whole blocks"
                 )
-            if self.block_size != remote_info.remote_block_size:
+            if self.block_size != remote_info.block_size:
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
                 )
-            remote_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.remote.block_ids, self._remote_physical_blocks_per_group[engine_id]
+            remote_physical_block_ids = self._remote_transfer_unit_ids(
+                engine_id, meta.remote.block_ids
             )
             remote_by_region = self._block_ids_by_region(
                 remote_physical_block_ids, remote_region_groups
@@ -244,13 +244,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     * self._physical_blocks_per_logical_kv_block
                     for group in local_region_groups
                 ]
-                num_remote_blocks = cdiv(
-                    meta.remote.num_tokens, remote_info.remote_block_size
-                )
+                num_remote_blocks = cdiv(meta.remote.num_tokens, remote_info.block_size)
             elif any(local_by_region) and (
                 dcp_active
-                or remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
+                or self._remote_physical_blocks_per_group.get(
+                    engine_id, self._physical_blocks_per_group
+                )
+                != self._physical_blocks_per_group
             ):
                 raise NotImplementedError(
                     "Region-mapped pulls with DCP or different logical block sizes "
@@ -266,7 +266,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         num_computed_blocks=num_computed_blocks,
                         num_remote_blocks=num_remote_blocks,
                         remote_rank=rank,
-                        remote_dcp_size=remote_info.remote_dcp_size,
+                        remote_dcp_size=remote_info.dcp_size,
                     ),
                     block_ids_by_region=True,
                 )
@@ -278,9 +278,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             ]
         else:
             remote_logical_block_ids = meta.remote.block_ids
-            meta.remote.block_ids = self._logical_to_kernel_block_ids(
-                remote_logical_block_ids,
-                self._remote_physical_blocks_per_group[engine_id],
+            meta.remote.block_ids = self._remote_transfer_unit_ids(
+                engine_id, remote_logical_block_ids
             )
             num_groups = len(meta.local_block_ids)
 
@@ -306,16 +305,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_rank=rank,
                             local_dcp_size=self.dcp_size,
                             local_dcp_rank=self.dcp_rank,
-                            remote_dcp_size=remote_info.remote_dcp_size,
+                            remote_dcp_size=remote_info.dcp_size,
                             local_num_computed_blocks=(
                                 meta.local_num_computed_blocks[g]
                             ),
                         )
-                    local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, self._physical_blocks_per_group
+                    local_physical_ids = self._transfer_unit_ids_from_specs(
+                        local_ids, self._group_specs
                     )
-                    remote_physical_ids = self._logical_to_kernel_block_ids(
-                        remote_ids, self._remote_physical_blocks_per_group[engine_id]
+                    remote_physical_ids = self._remote_transfer_unit_ids(
+                        engine_id, remote_ids
                     )
                 else:
                     local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
@@ -329,7 +328,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
 
         # D may have to perform multiple reads from different remote ranks.
-        remote_block_size = remote_info.remote_block_size
+        remote_block_size = remote_info.block_size
         for spec in read_specs:
             logger.debug(
                 "Remote agent %s available, calling _read_blocks"
@@ -405,18 +404,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-        if block_size_ratio > 1:
+        local = self._require_local_transfer_info()
+        if local.block_size != remote_info.block_size:
             if read_spec.block_ids_by_region:
                 raise NotImplementedError(
                     "Region-mapped NIXL transfers require matching physical block sizes"
                 )
-            local_block_ids, remote_block_ids = (
-                self._map_block_ids_for_block_size_ratio(
-                    local_block_ids, remote_block_ids, block_size_ratio
-                )
+            local_block_ids, remote_block_ids = self._map_block_ids(
+                local_block_ids, remote_block_ids, local, remote_info
             )
         # NOTE(rob): having the staging blocks be on the READER side is
         # not going to work well (since we will have to call rearrange tensors).
@@ -463,16 +458,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 == len(local_block_ids)
                 == len(self.kv_cache_config.transfer_groups)
             )
-            if not (self.dcp_size > 1 or remote_info.remote_dcp_size > 1):
+            if not (self.dcp_size > 1 or remote_info.dcp_size > 1):
                 local_block_ids, remote_block_ids = self._apply_prefix_caching(
                     decode_block_ids=local_block_ids,
                     prefill_block_ids=remote_block_ids,
-                    decode_physical_per_logical=(
-                        self._physical_blocks_per_logical_kv_block
-                    ),
-                    prefill_physical_per_logical=(
-                        remote_info.remote_physical_blocks_per_logical
-                    ),
+                    decode_physical_per_group=self._physical_blocks_per_group,
+                    prefill_physical_per_group=self._remote_physical_blocks_per_group[
+                        dst_engine_id
+                    ],
                 )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from

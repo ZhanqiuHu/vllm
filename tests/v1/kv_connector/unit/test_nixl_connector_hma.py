@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    LocalTransferInfo,
     MLAAttentionSpec,
 )
 
@@ -102,7 +103,11 @@ def region_pull_worker():
             KVCacheGroupSpec(["indexer"], spec),
         ],
     )
+    worker._group_specs = (spec, spec)
     worker._group_spec_types = (MLAAttentionSpec, MLAAttentionSpec)
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="D", tp_size=1, tp_rank=0, block_size=64
+    )
     worker.region_group_ids = [0, 1]
     worker.dst_region_group_ids = {"P": [0, 0]}
     worker._dst_pairs = {
@@ -114,10 +119,9 @@ def region_pull_worker():
     worker.transfer_topo.tp_ratio.return_value = 1
     worker.transfer_topo.block_size_ratio.return_value = 1
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-        remote_tp_size=4,
-        remote_dcp_size=1,
-        remote_block_size=64,
-        remote_physical_blocks_per_logical=2,
+        tp_size=4,
+        dcp_size=1,
+        block_size=64,
     )
     worker.source_ranks = {"P": [(0,), (0,)]}
     # The MLA regions move whole blocks.
@@ -152,10 +156,9 @@ def test_region_pull_ignores_allocation_padding(
     worker._physical_blocks_per_group = [local_ratio] * 2
     worker._remote_physical_blocks_per_group = {"P": [remote_ratio]}
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-        remote_tp_size=4,
-        remote_dcp_size=1,
-        remote_block_size=64,
-        remote_physical_blocks_per_logical=remote_ratio,
+        tp_size=4,
+        dcp_size=1,
+        block_size=64,
     )
     local_count = cdiv(num_tokens, 64 * local_ratio)
     remote_count = cdiv(num_tokens, 64 * remote_ratio)
@@ -228,8 +231,7 @@ def test_dcp_region_pull(region_pull_worker, num_pages, region_groups):
     worker.block_len_per_layer = [1024] * worker.num_regions
     worker.dcp_rank = 0
     remote = worker.transfer_topo.get_engine_info.return_value
-    remote.remote_tp_size = remote.remote_dcp_size = 8
-    remote.remote_physical_blocks_per_logical = 1
+    remote.tp_size = remote.dcp_size = 8
     worker._remote_physical_blocks_per_group = {"P": [1]}
     ranks = tuple(range(8))
     _whole_block_descs(worker, ranks)
@@ -639,7 +641,7 @@ def test_read_blocks_for_req_expands_remote_ids(
     block IDs when kernel block size != logical block size.
 
     The hot path always calls _logical_to_kernel_block_ids with
-    remote_info.remote_physical_blocks_per_logical (model-agnostic).
+    per-group remote registration geometry (model-agnostic).
     """
     from unittest.mock import MagicMock
 
@@ -702,8 +704,8 @@ def test_read_blocks_for_req_expands_remote_ids(
     # but set for realism.
     worker.transfer_topo.tp_ratio.return_value = tp_ratio
     remote_info = MagicMock()
-    remote_info.remote_physical_blocks_per_logical = remote_physical_per_logical
-    remote_info.remote_dcp_size = 1
+    remote_info.dcp_size = 1
+    remote_info.block_size = 16
     worker.transfer_topo.get_engine_info.return_value = remote_info
     worker.use_mla = False
 
@@ -730,6 +732,30 @@ def test_read_blocks_for_req_expands_remote_ids(
     assert meta.remote.block_ids == expected_remote_block_ids, (
         f"Expected {expected_remote_block_ids}, got {meta.remote.block_ids}"
     )
+
+
+def _prefix_caching_worker(*, local_ppl: int, n_groups: int = 2):
+    """Minimal worker for ``_apply_prefix_caching`` unit tests."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    mamba = MambaSpec(block_size=16, shapes=((8, 16),), dtypes=(torch.float16,))
+    specs = (attn, mamba)[:n_groups] if n_groups == 2 else (attn,) * n_groups
+    # Always FA+Mamba for hybrid tests (2 groups).
+    if n_groups == 2:
+        specs = (attn, mamba)
+    worker = object.__new__(NixlConnectorWorker)
+    worker._has_mamba = True
+    worker._physical_blocks_per_logical_kv_block = local_ppl
+    worker._group_specs = specs
+    worker._group_spec_types = tuple(type(s) for s in specs)
+    worker.kv_cache_config = make_kv_cache_config(block_size=16, mamba_enabled=True)
+    return worker
 
 
 @pytest.mark.cpu_test
@@ -777,22 +803,13 @@ def test_apply_prefix_caching_mamba_hybrid(
     """_apply_prefix_caching front-trims FA groups to
     min(local, remote) for Mamba hybrid models with heterogeneous TP.
     """
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-        NixlConnectorWorker,
-    )
-    from vllm.v1.kv_cache_interface import MambaSpec
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker._has_mamba = True
-    worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
-    worker._group_spec_types = (FullAttentionSpec, MambaSpec)
-    worker.kv_cache_config = make_kv_cache_config(block_size=16, mamba_enabled=True)
-
+    worker = _prefix_caching_worker(local_ppl=local_physical_per_logical)
+    n = len(local_block_ids)
     aligned_local, aligned_remote = worker._apply_prefix_caching(
         local_block_ids,
         remote_block_ids,
-        local_physical_per_logical,
-        remote_physical_per_logical,
+        [local_physical_per_logical] * n,
+        [remote_physical_per_logical] * n,
     )
 
     assert aligned_local == expected_local, (
@@ -857,22 +874,13 @@ def test_apply_prefix_caching_ssm_prefix_cache_hit(
     local block (placeholders dropped) and end-trims FA remote blocks on
     partial prefix cache hits when physical_per_logical matches.
     """
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-        NixlConnectorWorker,
-    )
-    from vllm.v1.kv_cache_interface import MambaSpec
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker._has_mamba = True
-    worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
-    worker._group_spec_types = (FullAttentionSpec, MambaSpec)
-    worker.kv_cache_config = make_kv_cache_config(block_size=16, mamba_enabled=True)
-
+    worker = _prefix_caching_worker(local_ppl=local_physical_per_logical)
+    n = len(local_block_ids)
     aligned_local, aligned_remote = worker._apply_prefix_caching(
         local_block_ids,
         remote_block_ids,
-        local_physical_per_logical,
-        remote_physical_per_logical,
+        [local_physical_per_logical] * n,
+        [remote_physical_per_logical] * n,
     )
 
     assert aligned_local == expected_local, (
@@ -888,20 +896,14 @@ def test_apply_prefix_caching_ssm_unpairable_slots_rejected():
     """Local SSM slots can only exceed the remote ones by the position D
     recomputes itself. A larger excess means the lists aren't
     position-aligned: fail loudly rather than transfer into wrong slots."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-        NixlConnectorWorker,
-    )
-    from vllm.v1.kv_cache_interface import MambaSpec
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker._has_mamba = True
-    worker._physical_blocks_per_logical_kv_block = 10
-    worker._group_spec_types = (FullAttentionSpec, MambaSpec)
-    worker.kv_cache_config = make_kv_cache_config(block_size=16, mamba_enabled=True)
+    worker = _prefix_caching_worker(local_ppl=10)
 
     with pytest.raises(AssertionError, match="unpairable SSM state slots"):
         worker._apply_prefix_caching(
-            [list(range(10)), [4, 5, 6, 7]], [list(range(10)), [8, 9]], 10, 10
+            [list(range(10)), [4, 5, 6, 7]],
+            [list(range(10)), [8, 9]],
+            [10, 10],
+            [10, 10],
         )
 
 
@@ -965,20 +967,7 @@ def test_mismatched_physical_per_logical_fails_with_prefix_caching(
     for the uncached suffix. The front-trim pairs remote prefix blocks
     with local suffix slots — a silent data corruption.
     """
-    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-        NixlConnectorWorker,
-    )
-
-    worker = object.__new__(NixlConnectorWorker)
-    worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
-    worker.kv_cache_config = make_kv_cache_config(
-        block_size=16,
-        mamba_enabled=True,
-    )
-    worker._has_mamba = True
-    worker._group_spec_types = tuple(
-        type(g.kv_cache_spec) for g in worker.kv_cache_config.kv_cache_groups
-    )
+    worker = _prefix_caching_worker(local_ppl=local_physical_per_logical)
 
     local_block_ids = (local_fa_blocks, ssm_blocks)
     remote_block_ids = (remote_fa_blocks, ssm_blocks)
@@ -986,8 +975,8 @@ def test_mismatched_physical_per_logical_fails_with_prefix_caching(
     aligned_local, aligned_remote = worker._apply_prefix_caching(
         local_block_ids,
         remote_block_ids,
-        local_physical_per_logical,
-        remote_physical_per_logical,
+        [local_physical_per_logical, local_physical_per_logical],
+        [remote_physical_per_logical, remote_physical_per_logical],
     )
 
     assert (
@@ -1147,7 +1136,7 @@ def _bind_worker_method(worker, name):
 
 
 @pytest.mark.cpu_test
-def test_map_block_ids_for_block_size_ratio_hybrid():
+def test_map_block_ids_hybrid_local_remote_info():
     """Attention groups expand to remote granularity and clip to the remote
     coverage; mamba state blocks pass through 1:1."""
     from unittest.mock import MagicMock
@@ -1155,7 +1144,11 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
         NixlConnectorWorker,
     )
-    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.kv_cache_interface import (
+        LocalTransferInfo,
+        MambaSpec,
+        RemoteTransferInfo,
+    )
 
     attn = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
@@ -1168,12 +1161,15 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     worker = MagicMock(spec=NixlConnectorWorker)
     worker._group_specs = (attn, mamba)
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
-    _bind_worker_method(worker, "_map_block_ids_for_block_size_ratio")
+    _bind_worker_method(worker, "_map_block_ids")
 
-    local, remote = worker._map_block_ids_for_block_size_ratio(
+    local_info = LocalTransferInfo(engine_id="D", tp_size=1, tp_rank=0, block_size=16)
+    remote_info = RemoteTransferInfo(tp_size=1, block_size=4, block_len=0)
+    local, remote = worker._map_block_ids(
         [[1, 2, 3], [7]],
         [list(range(30, 40)), [42]],
-        4,
+        local_info,
+        remote_info,
     )
     # [1, 2, 3] expand to sub-blocks [4..15], clipped to the 10 remote blocks.
     assert local == [list(range(4, 14)), [7]]
@@ -1182,7 +1178,7 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     # Attention-only full prefix hit: empty local list is preserved.
     worker._group_specs = (attn,)
     worker._group_spec_types = (FullAttentionSpec,)
-    local, remote = worker._map_block_ids_for_block_size_ratio([[]], [[30, 31]], 4)
+    local, remote = worker._map_block_ids([[]], [[30, 31]], local_info, remote_info)
     assert local == []
 
 
@@ -1686,6 +1682,27 @@ def test_logical_to_kernel_block_ids_expands_each_group_by_its_pages():
     """Each group's block ids expand to the blocks its own views split a
     block into; a group of whole-block state blocks is left as is."""
     assert NixlConnectorWorker._logical_to_kernel_block_ids([[0, 2], [3]], [3, 1]) == [
+        [0, 1, 2, 6, 7, 8],
+        [3],
+    ]
+
+
+@pytest.mark.cpu_test
+def test_transfer_unit_ids_from_specs_attention_expands_mamba_identity():
+    """Attention convert expands by registered rows; Mamba stays identity."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    ).apply_registered_geometry(rows_per_manager_block=3)
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((8, 16),),
+        dtypes=(torch.float16,),
+    )
+    assert NixlConnectorWorker._transfer_unit_ids_from_specs(
+        [[0, 2], [3]], (attn, mamba)
+    ) == [
         [0, 1, 2, 6, 7, 8],
         [3],
     ]

@@ -26,7 +26,6 @@ import zmq
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
-    EngineTransferInfo,
     TransferTopology,
     contiguous_byte_ranges,
     get_current_attn_backends,
@@ -53,7 +52,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
-    _is_ssm_spec,
     get_representative_spec_type,
     zmq_ctx,
 )
@@ -79,8 +77,10 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
+    LocalTransferInfo,
     MambaSpec,
     MLAAttentionSpec,
+    RemoteTransferInfo,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
     compute_layer_kv_cache_shape_bytes,
@@ -200,8 +200,11 @@ class NixlBaseConnectorWorker:
                 remote_tp_size=remote_tp_size,
             )
 
-            ssm = _is_ssm_spec(self._group_spec_types[group])
-            ratio = 1 if ssm else block_size_ratio
+            local_info = self._require_local_transfer_info()
+            # Peer bag from handshake (caller registers before this).
+            assert self.transfer_topo is not None
+            remote_info = self.transfer_topo.get_engine_info(nixl_agent_meta.engine_id)
+            ratio = self._page_nest_for_group(group, local_info, remote_info)
             block_len = self.block_len_per_layer[local] // ratio
             blocks = []
             for side_spec in (spec, remote_spec):
@@ -265,7 +268,7 @@ class NixlBaseConnectorWorker:
 
             if ranges_by_rank and remote is not None:
                 remote_len = nixl_agent_meta.block_lens[remote] // (
-                    1 if ssm else remote_split
+                    1 if ratio == 1 and block_size_ratio > 1 else remote_split
                 )
                 expected_len = (
                     block_len * remote_spec.page_size_bytes // spec.page_size_bytes
@@ -597,12 +600,15 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
-        transfer_block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.transfer_groups
-            if get_representative_spec_type(group.kv_cache_spec)
-            not in (MambaSpec, CircularBufferSpec)
-        ]
+        # Unwrap UniformType like _group_specs; LCM uses each type's opt-in.
+        transfer_block_sizes: list[int] = []
+        for group in kv_cache_config.transfer_groups:
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                group_spec = next(iter(group_spec.kv_cache_specs.values()))
+            size = group_spec.block_size_for_transfer_lcm()
+            if size is not None:
+                transfer_block_sizes.append(size)
         self.block_size = (
             math.lcm(*transfer_block_sizes)
             if transfer_block_sizes
@@ -842,7 +848,10 @@ class NixlBaseConnectorWorker:
         # Engine -> physical blocks per logical block of each of its cache
         # groups, and how many smaller blocks each of its token blocks moves as.
         self._remote_physical_blocks_per_group: dict[EngineId, list[int]] = {}
+        # Peer group specs with registration geometry when group counts match.
+        self._remote_group_specs: dict[EngineId, tuple[KVCacheSpec, ...]] = {}
         self._remote_block_splits: dict[EngineId, int] = {}
+        self._local_transfer_info: LocalTransferInfo | None = None
         self.dst_region_mem_types: dict[EngineId, list[str]] = {}
         self._registered_descs: list[Any] = []
         self._kv_unregistered = False
@@ -1172,24 +1181,23 @@ class NixlBaseConnectorWorker:
             for name in layer_names
             for local in self._regions_by_layer.get(name, ())
         }
+        # Produce peer TransferInfo first so `_tp_byte_ranges` consumes it
+        # (no ephemeral RemoteTransferInfo rebuild).
+        self.transfer_topo.register_remote_engine(
+            metadata.engine_id,
+            RemoteTransferInfo(
+                tp_size=remote_tp_size,
+                block_size=metadata.block_size,
+                block_len=metadata.block_lens[0],
+                dcp_size=remote_dcp_size,
+            ),
+        )
         senders = set[int]().union(
             *self._tp_byte_ranges(
                 metadata, list(regions), remote_tp_size, 1, 1, receiving=True
             )
         )
         self._push_senders[metadata.engine_id][remote_pp_rank] = len(senders)
-        self.transfer_topo.register_remote_engine(
-            metadata.engine_id,
-            EngineTransferInfo(
-                remote_tp_size=remote_tp_size,
-                remote_block_size=metadata.block_size,
-                remote_block_len=metadata.block_lens[0],
-                remote_physical_blocks_per_logical=max(
-                    metadata.physical_blocks_per_group, default=1
-                ),
-                remote_dcp_size=remote_dcp_size,
-            ),
-        )
         return self.nixl_wrapper.add_remote_agent(metadata.agent_metadata)
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1423,9 +1431,22 @@ class NixlBaseConnectorWorker:
         self._physical_blocks_per_logical_kv_block = max(
             self._physical_blocks_per_group
         )
+        self._group_specs = tuple(
+            spec.apply_registered_geometry(rows_per_manager_block=units)
+            for spec, units in zip(
+                self._group_specs, physical_blocks_per_group, strict=True
+            )
+        )
         self._logical_num_blocks = self.num_blocks
         self.block_size //= self._physical_blocks_per_logical_kv_block
         self.num_blocks *= self._physical_blocks_per_logical_kv_block
+        self._local_transfer_info = LocalTransferInfo(
+            engine_id=self.engine_id,
+            tp_size=self.transfer_tp_size,
+            tp_rank=self.transfer_tp_rank,
+            block_size=self.block_size,
+            dcp_size=self.dcp_size,
+        )
         self.transfer_topo = TransferTopology(
             tp_rank=self.transfer_tp_rank,
             tp_size=self.transfer_tp_size,
@@ -1865,8 +1886,15 @@ class NixlBaseConnectorWorker:
         for remote, local, group, ranges_by_rank in zip(
             pairs.remote, pairs.local, pairs.group, self._byte_ranges[engine_id]
         ):
-            ssm = _is_ssm_spec(self._group_spec_types[group])
-            ratio, split = (1, 1) if ssm else (block_size_ratio, remote_split)
+            local_info = self._require_local_transfer_info()
+            assert self.transfer_topo is not None
+            remote_info = self.transfer_topo.get_engine_info(engine_id)
+            # Attention nest == block_size_ratio; Mamba map nest stays 1.
+            nest = self._page_nest_for_group(group, local_info, remote_info)
+            if nest == 1 and block_size_ratio > 1:
+                ratio, split = 1, 1
+            else:
+                ratio, split = block_size_ratio, remote_split
             for rank, ranges in ranges_by_rank.items():
                 for offset, remote_offset, num_bytes in ranges:
                     local_range = (local, offset, num_bytes, ratio)
@@ -1970,14 +1998,17 @@ class NixlBaseConnectorWorker:
                 _MAX_HYBRID_BLOCK_SPLIT,
             )
             return
-        # Only token blocks split; recurrent state blocks move whole.
+        # Only token-lattice groups split; LCM opt-outs (Mamba/CircularBuffer)
+        # move whole — asked via the spec method, not a type sniff.
         group_by_layer = self.kv_cache_config.transfer_group_index_by_layer
+
+        def _opts_out_of_token_lattice(group: int) -> bool:
+            return self._group_specs[group].block_size_for_transfer_lcm() is None
+
         if any(
             block_len % split
             for block_len, names in zip(meta.block_lens, meta.region_members)
-            if not all(
-                _is_ssm_spec(self._group_spec_types[group_by_layer[n]]) for n in names
-            )
+            if not all(_opts_out_of_token_lattice(group_by_layer[n]) for n in names)
         ):
             logger.warning(
                 "Not pairing remote %d-token blocks with local %d-token blocks: "
@@ -1997,7 +2028,7 @@ class NixlBaseConnectorWorker:
         meta.block_size //= split
         meta.num_blocks *= split
         meta.physical_blocks_per_group = [
-            num * (1 if _is_ssm_spec(self._group_spec_types[group]) else split)
+            num * (1 if _opts_out_of_token_lattice(group) else split)
             for group, num in enumerate(meta.physical_blocks_per_group)
         ]
         self._remote_block_splits[meta.engine_id] = split
@@ -2100,18 +2131,23 @@ class NixlBaseConnectorWorker:
             self._split_remote_blocks(nixl_agent_meta)
 
         ### Register remote engine in TransferTopology (idempotent).
-        transfer_info = EngineTransferInfo(
-            remote_tp_size=remote_tp_size,
-            remote_block_size=nixl_agent_meta.block_size,
-            remote_block_len=nixl_agent_meta.block_lens[0],
-            remote_physical_blocks_per_logical=max(
-                nixl_agent_meta.physical_blocks_per_group, default=1
-            ),
-            remote_dcp_size=remote_dcp_size,
+        transfer_info = RemoteTransferInfo(
+            tp_size=remote_tp_size,
+            block_size=nixl_agent_meta.block_size,
+            block_len=nixl_agent_meta.block_lens[0],
+            dcp_size=remote_dcp_size,
         )
         self._remote_physical_blocks_per_group[engine_id] = (
             nixl_agent_meta.physical_blocks_per_group
         )
+        peer_units = nixl_agent_meta.physical_blocks_per_group
+        if len(peer_units) == len(self._group_specs):
+            self._remote_group_specs[engine_id] = tuple(
+                spec.apply_registered_geometry(rows_per_manager_block=units)
+                for spec, units in zip(self._group_specs, peer_units, strict=True)
+            )
+        else:
+            self._remote_group_specs.pop(engine_id, None)
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
 
@@ -2186,8 +2222,8 @@ class NixlBaseConnectorWorker:
 
         assert self.transfer_topo is not None
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
-        assert remote_info.remote_tp_size == remote_tp_size
-        assert remote_info.remote_dcp_size == remote_dcp_size
+        assert remote_info.tp_size == remote_tp_size
+        assert remote_info.dcp_size == remote_dcp_size
         # DCP sizes must divide one another; this is what keeps the
         # read-slicing math in pull_worker a closed form.
         assert (
@@ -2350,8 +2386,8 @@ class NixlBaseConnectorWorker:
         # The d2h block copies below are intentionally synchronous.
         with gpu_sync_allowed():
             for req_id, meta in metadata.reqs_to_save.items():
-                meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                    meta.local_block_ids, self._physical_blocks_per_group
+                meta.local_physical_block_ids = self._transfer_unit_ids_from_specs(
+                    meta.local_block_ids, self._group_specs
                 )
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2615,15 +2651,22 @@ class NixlBaseConnectorWorker:
             # minimum count (hybrid heterogeneous TP).
             remote_info = self.transfer_topo.get_engine_info(meta.remote.engine_id)
             block_size_ratio = self.transfer_topo.block_size_ratio(
-                remote_info.remote_block_size
+                remote_info.block_size
             )
-            hetero_ppl = (
-                remote_info.remote_physical_blocks_per_logical
-                != self._physical_blocks_per_logical_kv_block
+            remote_ppl = self._remote_physical_blocks_per_group.get(
+                meta.remote.engine_id, self._physical_blocks_per_group
             )
+            hetero_ppl = remote_ppl != self._physical_blocks_per_group
+            local_ti = self._require_local_transfer_info()
             if block_size_ratio > 1 or self.enable_permute_local_kv or hetero_ppl:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
-                    if not local_group or _is_ssm_spec(self._group_spec_types[g]):
+                    if not local_group:
+                        continue
+                    # Mamba map nest stays 1 under engine ratio > 1 — skip.
+                    if (
+                        block_size_ratio > 1
+                        and self._page_nest_for_group(g, local_ti, remote_info) == 1
+                    ):
                         continue
                     # Number of remote-sized sub-blocks the transfer covered;
                     # everything past this was clipped and must be zeroed.
@@ -2886,18 +2929,40 @@ class NixlBaseConnectorWorker:
                         exc_info=True,
                     )
 
-    def _map_block_ids_for_block_size_ratio(
+    def _require_local_transfer_info(self) -> LocalTransferInfo:
+        assert self._local_transfer_info is not None, (
+            "LocalTransferInfo is produced in register_kv_caches before planning"
+        )
+        return self._local_transfer_info
+
+    def _page_nest_for_group(
+        self,
+        group: int,
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
+    ) -> int:
+        """Remote pages per local engine page for this group, via ``map``."""
+        if remote.block_size <= 0 or local.block_size % remote.block_size != 0:
+            return 1
+        units = local.block_size // remote.block_size
+        if units == 1:
+            return 1
+        loc, _ = self._group_specs[group].map_transfer_units(
+            [0], list(range(units)), local, remote
+        )
+        return len(loc) if loc else 1
+
+    def _map_block_ids(
         self,
         local_block_ids: BlockIds,
         remote_block_ids: BlockIds,
-        block_size_ratio: int,
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
     ) -> tuple[BlockIds, BlockIds]:
         """Map per-group block ids via each group's ``map_transfer_units``.
 
-        ``block_size_ratio`` is topo ``local_page_size // remote_page_size``.
-        Passed as page sizes ``(block_size_ratio, 1)`` so Attention nests by
-        that factor and atomic specs (e.g. Mamba) keep identity — no type
-        sniff in the connector.
+        Consumes general local/remote engine info. Attention nests by
+        ``local.block_size // remote.block_size``; Mamba stays identity.
 
         ex: remote (prefill) block ids with block_size 4:
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -2909,10 +2974,7 @@ class NixlBaseConnectorWorker:
         for i, remote_group in enumerate(remote_block_ids):
             local_group = local_block_ids[i] if local_block_ids else []
             loc, rem = self._group_specs[i].map_transfer_units(
-                local_group,
-                remote_group,
-                local_page_size=block_size_ratio,
-                remote_page_size=1,
+                local_group, remote_group, local, remote
             )
             mapped_local.append(loc)
             mapped_remote.append(rem)
@@ -2922,19 +2984,40 @@ class NixlBaseConnectorWorker:
         return mapped_local, mapped_remote
 
     @staticmethod
+    def _transfer_unit_ids_from_specs(
+        manager_block_ids: BlockIds,
+        group_specs: Sequence[KVCacheSpec],
+    ) -> BlockIds:
+        """Run each group's ``convert_manager_block_ids_to_transfer_unit_ids``."""
+        return [
+            spec.convert_manager_block_ids_to_transfer_unit_ids(group)
+            for spec, group in zip(group_specs, manager_block_ids, strict=True)
+        ]
+
+    @staticmethod
     def _logical_to_kernel_block_ids(
         block_ids: BlockIds, physical_blocks_per_group: Sequence[int]
     ) -> BlockIds:
-        """Expand each group's block ids to the kernel blocks they span, e.g.
-        ``[1, 3]`` at 2 kernel blocks per block to ``[2, 3, 6, 7]``."""
+        """Expand manager ids by a per-group int ratio (hetero peer layouts)."""
         if all(num == 1 for num in physical_blocks_per_group):
             return block_ids
         return [
             (np.asarray(group, dtype=np.int64)[:, None] * num + np.arange(num))
             .reshape(-1)
             .tolist()
-            for group, num in zip(block_ids, physical_blocks_per_group)
+            for group, num in zip(block_ids, physical_blocks_per_group, strict=True)
         ]
+
+    def _remote_transfer_unit_ids(
+        self, engine_id: EngineId, manager_block_ids: BlockIds
+    ) -> BlockIds:
+        """Expand remote manager ids using peer specs when group counts match."""
+        remote_specs = getattr(self, "_remote_group_specs", {}).get(engine_id)
+        if remote_specs is not None and len(remote_specs) == len(manager_block_ids):
+            return self._transfer_unit_ids_from_specs(manager_block_ids, remote_specs)
+        return self._logical_to_kernel_block_ids(
+            manager_block_ids, self._remote_physical_blocks_per_group[engine_id]
+        )
 
     def _apply_dcp_prefix_caching(
         self,
@@ -3062,98 +3145,57 @@ class NixlBaseConnectorWorker:
         self,
         decode_block_ids: BlockIds,
         prefill_block_ids: BlockIds,
-        decode_physical_per_logical: int,
-        prefill_physical_per_logical: int,
+        decode_physical_per_group: Sequence[int],
+        prefill_physical_per_group: Sequence[int],
     ) -> tuple[BlockIds, BlockIds]:
         """Trim block ID lists so only the uncomputed suffix is transferred.
 
         Inputs are *kernel* (physical) block IDs, already expanded from logical IDs
-        with each side's physical-per-logical ratio. Both pull and push call this after
-        that expansion so the trim happens at kernel granularity.
+        with each side's per-group registration geometry. Both pull and push call
+        this after that expansion so the trim happens at kernel granularity.
 
         The prefix-cache hit is always on the decode (D) side, so ``decode``
         holds only its uncomputed blocks while prefill (P) holds the full
         sequence. This is mode-independent: pull passes its own (D) blocks as
         ``decode``, push passes the remote D registration as ``decode``.
 
-        For non-Mamba models: end-trim ``prefill`` to match ``decode`` count, so
-        already-cached prefix blocks are skipped in the transfer.
-
-        For Mamba hybrid: SSM groups pair state slots by position and FA
-        groups end-trim to the uncomputed suffix when physical-per-logical
-        matches.
+        Non-hybrid: end-trim ``prefill`` to match ``decode`` count.
+        Hybrid: each group's ``KVCacheSpec.align_prefix_block_ids`` owns the
+        trim policy (Attention lattice vs Mamba state slots).
         """
-        # Partial prefix cache hit: just transfer uncomputed blocks.
-        # Skip mamba groups — their blocks represent full state (conv+ssm),
-        # not per-token data, so trimming would corrupt the transfer.
         prefill_block_ids = list(prefill_block_ids)
+        decode_block_ids = list(decode_block_ids)
         if not self._has_mamba:
             for i, prefill_group in enumerate(prefill_block_ids):
                 num_decode_blocks = len(decode_block_ids[i])
                 assert num_decode_blocks <= len(prefill_group)
                 if num_decode_blocks < len(prefill_group):
                     prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
-        else:
-            # (NOTE: ZhanqiuHu) HeteroTP can cause different kernel block counts
-            # due to logical block rounding.
-            # Example: 640 prompt tokens, kernel_block_size=64
-            #   prefill physical_per_logical=10, decode physical_per_logical=6
-            #   prefill logical ids from kv_transfer_params = [0]
-            #   decode logical ids allocated = [0, 1]
-            #   prefill kernel blocks: [0..9]  (1*10=10)
-            #   decode kernel blocks:  [0..11] (2*6=12)
-            #   actual data blocks = ceil(640/64) = 10, trim both to 10
-            # Vice versa (prefill physical_per_logical=6, decode=10):
-            #   prefill logical ids = [0, 1], decode logical ids = [0]
-            #   prefill kernel blocks: [0..11] (2*6=12)
-            #   decode kernel blocks:  [0..9]  (1*10=10)
-            #   actual data blocks = ceil(640/64) = 10, trim both to 10
-            decode_block_ids = list(decode_block_ids)
-            for i, prefill_group in enumerate(prefill_block_ids):
-                num_decode_blocks = len(decode_block_ids[i])
-                num_prefill_blocks = len(prefill_group)
-                if _is_ssm_spec(self._group_spec_types[i]):
-                    if num_decode_blocks == num_prefill_blocks:
-                        continue
-                    # Only state-bearing slots reach here, normally just one
-                    # (see get_exchange_clipped_blocks). A longer prefill list
-                    # carries earlier positions the decode side already has
-                    # (prefix hit) -> take its tail; a longer decode list holds
-                    # the position D recomputes itself, which gets no prefill
-                    # state.
-                    assert num_decode_blocks - num_prefill_blocks <= 1, (
-                        f"Group {i}: unpairable SSM state slots, "
-                        f"decode={num_decode_blocks} prefill={num_prefill_blocks}"
-                    )
-                    num_blocks = min(num_decode_blocks, num_prefill_blocks)
-                    if num_decode_blocks < num_prefill_blocks:
-                        prefill_block_ids[i] = prefill_group[-num_blocks:]
-                    else:
-                        decode_block_ids[i] = decode_block_ids[i][:num_blocks]
-                elif (
-                    decode_physical_per_logical == prefill_physical_per_logical
-                    and num_decode_blocks < num_prefill_blocks
-                ):
-                    # Partial prefix cache hit for FA group.
-                    prefill_block_ids[i] = prefill_group[-num_decode_blocks:]
-                else:
-                    # TODO Handle prefix caching with different block_sizes
-                    # Allocation rounding legitimately leaves up to
-                    # ppl - 1 trailing dead kernel blocks per side (plus one
-                    # extra decode block for the recomputed final token), so
-                    # the counts may differ by up to the sum of the two
-                    # ratios; anything larger indicates mismatched lists.
-                    max_padding = (
-                        decode_physical_per_logical + prefill_physical_per_logical
-                    )
-                    assert abs(num_decode_blocks - num_prefill_blocks) <= max_padding, (
-                        f"Group {i}: |{num_decode_blocks} - "
-                        f"{num_prefill_blocks}| > {max_padding}"
-                    )
-                    num_blocks = min(num_decode_blocks, num_prefill_blocks)
-                    decode_block_ids[i] = decode_block_ids[i][:num_blocks]
-                    prefill_block_ids[i] = prefill_group[:num_blocks]
-        return decode_block_ids, prefill_block_ids
+            return decode_block_ids, prefill_block_ids
+
+        # (NOTE: ZhanqiuHu) HeteroTP can cause different kernel block counts
+        # due to logical block rounding.
+        # Example: 640 prompt tokens, kernel_block_size=64
+        #   prefill physical_per_logical=10, decode physical_per_logical=6
+        #   prefill logical ids from kv_transfer_params = [0]
+        #   decode logical ids allocated = [0, 1]
+        #   prefill kernel blocks: [0..9]  (1*10=10)
+        #   decode kernel blocks:  [0..11] (2*6=12)
+        #   actual data blocks = ceil(640/64) = 10, trim both to 10
+        aligned_decode: list[list[int]] = []
+        aligned_prefill: list[list[int]] = []
+        for i, (decode_group, prefill_group) in enumerate(
+            zip(decode_block_ids, prefill_block_ids, strict=True)
+        ):
+            dec, pref = self._group_specs[i].align_prefix_block_ids(
+                decode_group,
+                prefill_group,
+                decode_units_per_manager=decode_physical_per_group[i],
+                prefill_units_per_manager=prefill_physical_per_group[i],
+            )
+            aligned_decode.append(dec)
+            aligned_prefill.append(pref)
+        return aligned_decode, aligned_prefill
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Get the KV transfer stats for the connector."""
@@ -3351,6 +3393,7 @@ class NixlBaseConnectorWorker:
         self.dst_region_mem_types.pop(engine_id, None)
         self.source_ranks.pop(engine_id, None)
         self._remote_physical_blocks_per_group.pop(engine_id, None)
+        self._remote_group_specs.pop(engine_id, None)
         self._remote_block_splits.pop(engine_id, None)
         self._byte_ranges.pop(engine_id, None)
         self._push_senders.pop(engine_id, None)

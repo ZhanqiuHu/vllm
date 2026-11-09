@@ -36,6 +36,38 @@ _SpecT = TypeVar("_SpecT", bound="KVCacheSpec")
 
 
 # ---------------------------------------------------------------------------
+# Engine-level transfer info (data only; consumed by KVCacheSpec transfer APIs)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LocalTransferInfo:
+    """This engine's transfer-session facts (not cache-type policy)."""
+
+    engine_id: str
+    tp_size: int
+    tp_rank: int
+    block_size: int
+    """Engine token lattice (tokens per block) used for P/D page pairing."""
+    dcp_size: int = 1
+
+
+@dataclass(frozen=True)
+class RemoteTransferInfo:
+    """Peer engine's transfer-session facts (not cache-type policy)."""
+
+    tp_size: int
+    block_size: int
+    """Peer's engine token lattice (tokens per block)."""
+    block_len: int
+    """Bytes per registered peer block (first region; topology helper)."""
+    dcp_size: int = 1
+    pp_rank: int = 0
+    start_layer: int = 0
+    end_layer: int = 0
+
+
+# ---------------------------------------------------------------------------
 # KV cache quantization mode
 # ---------------------------------------------------------------------------
 
@@ -400,21 +432,66 @@ class KVCacheSpec:
         """
         return self
 
+    def block_size_for_transfer_lcm(self) -> int | None:
+        """Token page size for the engine transfer ``block_size`` LCM, or opt out.
+
+        Default: participate with ``self.block_size``. Mamba / CircularBuffer
+        return ``None`` (same outcome as today's NIXL type-name LCM skip).
+        """
+        return self.block_size
+
+    def apply_registered_geometry(self, *, rows_per_manager_block: int = 1) -> Self:
+        """Apply connector-measured registration geometry. Default: unchanged.
+
+        ``rows_per_manager_block`` is ``cache.shape[0] // num_manager_blocks``
+        (max over layers in the group). Types that subdivide a manager block
+        store it; others ignore it.
+        """
+        return self
+
+    def convert_manager_block_ids_to_transfer_unit_ids(
+        self,
+        manager_block_ids: Sequence[int],
+    ) -> list[int]:
+        """Manager block ids → registered transfer-unit ids. Default: identity."""
+        return list(manager_block_ids)
+
     def map_transfer_units(
         self,
         local_block_ids: Sequence[int],
         remote_block_ids: Sequence[int],
-        *,
-        local_page_size: int,
-        remote_page_size: int,
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
     ) -> tuple[list[int], list[int]]:
-        """Map request block ids when local and peer page sizes may differ.
+        """Map request block ids using general local/remote engine info.
 
-        ``local_page_size`` / ``remote_page_size`` are page granules in the same
-        unit (typically tokens per page). Default: identity — pages are atomic
-        and do not nest across engines (e.g. Mamba). Attention overrides.
+        Default: identity — this cache type does not nest pages across engines
+        (e.g. Mamba). Attention overrides using ``local.block_size`` /
+        ``remote.block_size``.
         """
         return list(local_block_ids), list(remote_block_ids)
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """Align decode/prefill unit lists after a prefix-cache hit.
+
+        Default: end-trim prefill to the decode count. Token-lattice Attention
+        and state-slot Mamba override when their trim rules differ.
+        ``*_units_per_manager`` are per-group registration geometry (not an
+        engine-wide Attention max).
+        """
+        del decode_units_per_manager, prefill_units_per_manager
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        if len(decode) < len(prefill):
+            return decode, prefill[-len(decode) :]
+        return decode, prefill
 
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
@@ -642,6 +719,9 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
+    registered_rows_per_manager_block: int = 1
+    """Registered cache rows spanned by one manager Attention block (>1 when
+    the backend splits a manager block across several registered units)."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -723,21 +803,20 @@ class AttentionSpec(KVCacheSpec):
         self,
         local_block_ids: Sequence[int],
         remote_block_ids: Sequence[int],
-        *,
-        local_page_size: int,
-        remote_page_size: int,
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
     ) -> tuple[list[int], list[int]]:
-        """Expand local Attention block ids onto the peer page lattice.
+        """Expand local Attention block ids onto the peer engine page lattice.
 
-        One local page spans ``local_page_size // remote_page_size`` peer pages.
-        Expanded ids past ``remote_block_ids`` are clipped.
+        One local engine page spans ``local.block_size // remote.block_size``
+        peer pages. Expanded ids past ``remote_block_ids`` are clipped.
         """
-        if remote_page_size <= 0 or local_page_size % remote_page_size != 0:
+        if remote.block_size <= 0 or local.block_size % remote.block_size != 0:
             raise ValueError(
-                f"Local page size {local_page_size} is not divisible "
-                f"by remote page size {remote_page_size}."
+                f"Local block size {local.block_size} is not divisible "
+                f"by remote block size {remote.block_size}."
             )
-        units = local_page_size // remote_page_size
+        units = local.block_size // remote.block_size
         if units == 1:
             return list(local_block_ids), list(remote_block_ids)
         expanded: list[int] = []
@@ -747,6 +826,53 @@ class AttentionSpec(KVCacheSpec):
         if len(expanded) > len(remote_block_ids):
             expanded = expanded[: len(remote_block_ids)]
         return expanded, list(remote_block_ids)
+
+    def apply_registered_geometry(self, *, rows_per_manager_block: int = 1) -> Self:
+        if rows_per_manager_block <= 0:
+            raise ValueError(
+                "rows_per_manager_block must be positive, "
+                f"got {rows_per_manager_block}."
+            )
+        if rows_per_manager_block == self.registered_rows_per_manager_block:
+            return self
+        return replace(self, registered_rows_per_manager_block=rows_per_manager_block)
+
+    def convert_manager_block_ids_to_transfer_unit_ids(
+        self,
+        manager_block_ids: Sequence[int],
+    ) -> list[int]:
+        units = self.registered_rows_per_manager_block
+        if units == 1:
+            return list(manager_block_ids)
+        return [
+            unit
+            for manager_id in manager_block_ids
+            for unit in range(manager_id * units, manager_id * units + units)
+        ]
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """FA/token-page trim: end-trim on matching geometry, else pad-aware."""
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        num_decode, num_prefill = len(decode), len(prefill)
+        if (
+            decode_units_per_manager == prefill_units_per_manager
+            and num_decode < num_prefill
+        ):
+            return decode, prefill[-num_decode:]
+        max_padding = decode_units_per_manager + prefill_units_per_manager
+        assert abs(num_decode - num_prefill) <= max_padding, (
+            f"|{num_decode} - {num_prefill}| > {max_padding}"
+        )
+        num_blocks = min(num_decode, num_prefill)
+        return decode[:num_blocks], prefill[:num_blocks]
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1141,6 +1267,37 @@ class CircularBufferSpec(AttentionSpec):
     reads the open group's committed keys from the ring.
     """
 
+    def block_size_for_transfer_lcm(self) -> int | None:
+        return None
+
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        local: LocalTransferInfo,
+        remote: RemoteTransferInfo,
+    ) -> tuple[list[int], list[int]]:
+        """Ring slots are not an engine token-page lattice — never nest."""
+        del local, remote
+        return list(local_block_ids), list(remote_block_ids)
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        # Not a token-page lattice — do not inherit Attention pad/hetero trim.
+        return KVCacheSpec.align_prefix_block_ids(
+            self,
+            decode_block_ids,
+            prefill_block_ids,
+            decode_units_per_manager=decode_units_per_manager,
+            prefill_units_per_manager=prefill_units_per_manager,
+        )
+
     @property
     def block_table_token_alignment(self) -> int | None:
         return None
@@ -1272,6 +1429,36 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+
+    def block_size_for_transfer_lcm(self) -> int | None:
+        return None
+
+    def align_prefix_block_ids(
+        self,
+        decode_block_ids: Sequence[int],
+        prefill_block_ids: Sequence[int],
+        *,
+        decode_units_per_manager: int = 1,
+        prefill_units_per_manager: int = 1,
+    ) -> tuple[list[int], list[int]]:
+        """Pair state-bearing slots by position; drop prefix-hit placeholders."""
+        del decode_units_per_manager, prefill_units_per_manager
+        decode = list(decode_block_ids)
+        prefill = list(prefill_block_ids)
+        num_decode, num_prefill = len(decode), len(prefill)
+        if num_decode == num_prefill:
+            return decode, prefill
+        # Only state-bearing slots reach here, normally just one. A longer
+        # prefill list carries earlier positions the decode side already has
+        # (prefix hit) -> take its tail; a longer decode list holds the
+        # position D recomputes itself, which gets no prefill state.
+        assert num_decode - num_prefill <= 1, (
+            f"unpairable SSM state slots, decode={num_decode} prefill={num_prefill}"
+        )
+        num_blocks = min(num_decode, num_prefill)
+        if num_decode < num_prefill:
+            return decode, prefill[-num_blocks:]
+        return decode[:num_blocks], prefill
 
     @property
     def state_content_size_bytes(self) -> int:

@@ -464,6 +464,10 @@ def _register_overlaid_mla_worker(
         ],
         kv_cache_groups=groups,
     )
+    worker._group_specs = tuple(g.kv_cache_spec for g in groups)
+    worker._group_spec_types = tuple(type(g.kv_cache_spec) for g in groups)
+    worker._physical_blocks_per_group = [1] * len(groups)
+    worker._remote_group_specs = {}
 
     with (
         patch.object(bw, "TransferTopology", return_value=MagicMock()),
@@ -774,7 +778,8 @@ def _make_remote_meta(
         base = worker.kv_caches_base_addr[worker.engine_id][0][region]
         tensor = next(i for i, (lo, hi) in enumerate(tensor_ranges) if lo <= base < hi)
         base_addrs.append(0x10_000_000 * (tensor + 1))
-        if not bw._is_ssm_spec(worker._group_spec_types[group_by_layer[names[0]]]):
+        group = group_by_layer[names[0]]
+        if worker._group_specs[group].block_size_for_transfer_lcm() is not None:
             # Per-token block bytes are TP-independent for MLA hybrids.
             block_lens.append(
                 worker.block_len_per_layer[region]

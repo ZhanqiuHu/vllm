@@ -21,7 +21,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, iter_layer_specs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    RemoteTransferInfo,
+    iter_layer_specs,
+)
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
@@ -33,6 +38,9 @@ EngineId = str
 # block ids as returned by the hybrid KV cache manager. list[list[int]] are allow
 # mutability and are for connector internal use only.
 BlockIds = tuple[list[int], ...] | list[list[int]]
+
+# Peer session bag used by TransferTopology (was EngineTransferInfo).
+EngineTransferInfo = RemoteTransferInfo
 
 
 def clip_ssm_state_blocks(blocks: list[int], num_spec_blocks: int) -> list[int]:
@@ -472,46 +480,12 @@ def contiguous_byte_ranges(
     ]
 
 
-# ---- Per-engine transfer info ----
-
-
-@dataclass(frozen=True)
-class EngineTransferInfo:
-    """Common per-remote-engine transfer state, computed at handshake.
-
-    Stored per ``(engine_id, pp_rank)`` inside ``TransferTopology._engines``.
-    """
-
-    remote_tp_size: int
-
-    remote_block_len: int
-    """Block length (bytes)"""
-
-    remote_block_size: int
-    """Tokens per block."""
-
-    remote_physical_blocks_per_logical: int
-    """Physical blocks per logical block."""
-
-    remote_pp_rank: int = 0
-    """Remote producer PP rank for this engine."""
-
-    start_layer: int = 0
-    """Global index of the first layer owned by this PP rank."""
-
-    end_layer: int = 0
-    """Exclusive global index after the last layer owned by this PP rank."""
-
-    remote_dcp_size: int = 1
-    """Remote decode context parallel size."""
-
-
 # ---- Transfer topology ----
 
 
 @dataclass
 class TransferTopology:
-    """Single source of truth for local TP identity and per-engine remote info."""
+    """Local TP identity plus per-peer ``RemoteTransferInfo`` session bags."""
 
     tp_rank: int
     tp_size: int
@@ -527,7 +501,7 @@ class TransferTopology:
     def __post_init__(self):
         self.local_physical_heads = max(1, self.total_num_kv_heads // self.tp_size)
 
-        self._engines: dict[tuple[EngineId, int], EngineTransferInfo] = {}
+        self._engines: dict[tuple[EngineId, int], RemoteTransferInfo] = {}
 
     # ============================================================
     # Engine registration
@@ -536,8 +510,8 @@ class TransferTopology:
     def register_remote_engine(
         self,
         remote_engine_id: EngineId,
-        info: EngineTransferInfo,
-    ) -> EngineTransferInfo:
+        info: RemoteTransferInfo,
+    ) -> RemoteTransferInfo:
         """Register a remote engine, unifying worker dicts state.
 
         The caller (worker) is responsible for computing the info via
@@ -547,7 +521,7 @@ class TransferTopology:
             f"Cannot register local engine {self.engine_id} as remote. "
             f"Local identity is set via __init__ params."
         )
-        engine_key = (remote_engine_id, info.remote_pp_rank)
+        engine_key = (remote_engine_id, info.pp_rank)
         if engine_key in self._engines:
             return self._engines[engine_key]
         self._engines[engine_key] = info
@@ -555,7 +529,7 @@ class TransferTopology:
 
     def get_engine_info(
         self, remote_engine_id: EngineId, remote_pp_rank: int = 0
-    ) -> EngineTransferInfo:
+    ) -> RemoteTransferInfo:
         return self._engines[(remote_engine_id, remote_pp_rank)]
 
     def unregister_remote_engine(self, remote_engine_id: EngineId) -> None:
@@ -610,7 +584,7 @@ class TransferTopology:
         number of TP workers being greater than the number of KV heads.
         """
         return (
-            self._engines[(remote_engine_id, remote_pp_rank)].remote_tp_size
+            self._engines[(remote_engine_id, remote_pp_rank)].tp_size
             > self.total_num_kv_heads
         )
 
@@ -697,7 +671,7 @@ class TransferTopology:
         multiple remote ranks.
         """
         info = self._engines[(remote_engine_id, remote_pp_rank)]
-        tp_ratio = self.tp_ratio(info.remote_tp_size)
+        tp_ratio = self.tp_ratio(info.tp_size)
         if tp_ratio > 0:
             return [self.tp_rank // tp_ratio]
         # remote TP > local TP: read from |tp_ratio| remote workers
@@ -709,13 +683,13 @@ class TransferTopology:
         info = self._engines[(remote_engine_id, remote_pp_rank)]
         return (
             f"TransferTopology("
-            f"tp_ratio={self.tp_ratio(info.remote_tp_size)}, "
+            f"tp_ratio={self.tp_ratio(info.tp_size)}, "
             f"num_kv_heads={self.total_num_kv_heads if not self.is_mla else 1}, "
             f"local_tp={self.tp_size}, "
-            f"remote_tp={info.remote_tp_size}, "
+            f"remote_tp={info.tp_size}, "
             f"remote_pp={remote_pp_rank}, "
             f"local_dcp={self.dcp_size}, "
-            f"remote_dcp={info.remote_dcp_size}, "
+            f"remote_dcp={info.dcp_size}, "
             f"local_rank={self.tp_rank}, "
-            f"remote_block_len={info.remote_block_len})"
+            f"remote_block_len={info.block_len})"
         )
