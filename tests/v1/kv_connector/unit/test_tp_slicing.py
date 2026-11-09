@@ -15,7 +15,11 @@ from tests.v1.kv_connector.unit.utils import transfer_kv
 from vllm.v1.attention.backends.gdn_attn import GDNSpec
 from vllm.v1.attention.backends.mamba1_attn import Mamba1Spec
 from vllm.v1.attention.backends.mamba2_attn import Mamba2Spec
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MambaSpec,
+    TPPlacement,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -82,7 +86,12 @@ def test_receivers_spread_reads_across_replicas():
             p_rank
             for p_rank in range(8)
             if d_spec.slice_for_tp_transfer(
-                cache, 4, d_rank, p_spec, 8, p_rank, receiving=True
+                cache,
+                TPPlacement(4, d_rank),
+                p_spec,
+                cache,
+                TPPlacement(8, p_rank),
+                receiving=True,
             )
         ]
         for d_rank in range(4)
@@ -102,7 +111,12 @@ def test_replicated_heads_read_one_replica():
             p_rank
             for p_rank in range(2)
             if spec.slice_for_tp_transfer(
-                cache, 4, d_rank, spec, 2, p_rank, receiving=True
+                cache,
+                TPPlacement(4, d_rank),
+                spec,
+                cache,
+                TPPlacement(2, p_rank),
+                receiving=True,
             )
         ]
         for d_rank in range(4)
@@ -124,10 +138,26 @@ def test_custom_head_slots_transfer_only_whole_pages():
         )
 
     cache = torch.empty(NUM_BLOCKS, 2, BLOCK_SIZE, 4 * HEAD_SIZE, device="meta")
-    slices = spec(4).slice_for_tp_transfer(cache, 1, 0, spec(4), 1, 0, receiving=True)
-    assert slices == [cache]
+    views = spec(4).slice_for_tp_transfer(
+        cache,
+        TPPlacement(1, 0),
+        spec(4),
+        cache,
+        TPPlacement(1, 0),
+        receiving=True,
+    )
+    assert len(views) == 1
+    assert views[0].local is cache
+    assert views[0].remote is cache
     with pytest.raises(NotImplementedError):
-        spec(4).slice_for_tp_transfer(cache, 1, 0, spec(2), 2, 0, receiving=True)
+        spec(4).slice_for_tp_transfer(
+            cache,
+            TPPlacement(1, 0),
+            spec(2),
+            cache,
+            TPPlacement(2, 0),
+            receiving=True,
+        )
 
 
 CONV_ROWS = 3
@@ -207,11 +237,26 @@ def test_mamba_spec_without_tp_layout_transfers_only_whole_pages():
         block_size=BLOCK_SIZE, shapes=((8, 3), (8, 4)), dtypes=(torch.float32,) * 2
     )
     block = torch.empty(NUM_BLOCKS, 1, 1, spec.page_size_bytes, device="meta")
-    assert spec.slice_for_tp_transfer(block, 2, 1, spec, 2, 1, receiving=True) == [
-        block
-    ]
+    views = spec.slice_for_tp_transfer(
+        block,
+        TPPlacement(2, 1),
+        spec,
+        block,
+        TPPlacement(2, 1),
+        receiving=True,
+    )
+    assert len(views) == 1
+    assert views[0].local is block
+    assert views[0].remote is block
     with pytest.raises(NotImplementedError):
-        spec.slice_for_tp_transfer(block, 2, 0, spec, 1, 0, receiving=True)
+        spec.slice_for_tp_transfer(
+            block,
+            TPPlacement(2, 0),
+            spec,
+            block,
+            TPPlacement(1, 0),
+            receiving=True,
+        )
 
 
 def test_mamba2_replicated_groups_fail_closed():
@@ -230,7 +275,14 @@ def test_mamba2_replicated_groups_fail_closed():
     )
     block = torch.empty(NUM_BLOCKS, 1, 1, tp2.page_size_bytes, device="meta")
     with pytest.raises(NotImplementedError, match="does not shard evenly"):
-        tp2.slice_for_tp_transfer(block, 2, 0, tp1, 1, 0, receiving=True)
+        tp2.slice_for_tp_transfer(
+            block,
+            TPPlacement(2, 0),
+            tp1,
+            block,
+            TPPlacement(1, 0),
+            receiving=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -362,8 +414,13 @@ def test_mamba_specs_split_real_model_conv_states(
         dtypes=(torch.bfloat16, torch.bfloat16),
     )
     block = torch.empty(1, 1, 1, spec.page_size_bytes, dtype=torch.int8, device="meta")
-    views = spec.slice_for_tp_transfer(
-        block, local_tp, 0, spec, local_tp, 0, receiving=True
+    paired_views = spec.slice_for_tp_transfer(
+        block,
+        TPPlacement(local_tp, 0),
+        spec,
+        block,
+        TPPlacement(local_tp, 0),
+        receiving=True,
     )
-    conv_ranges = [view.numel() // (conv_rows * 2) for view in views[:-1]]
+    conv_ranges = [view.local.numel() // (conv_rows * 2) for view in paired_views[:-1]]
     assert conv_ranges == list(expected_proj_dims)

@@ -98,6 +98,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     SlidingWindowSpec,
+    TPShard,
     is_quantized_kv_cache,
     iter_layer_specs,
 )
@@ -157,17 +158,25 @@ class _NVFP4TPSlicing:
     ``AttentionSpec``; then this becomes a single ``NVFP4AttentionSpec``.
     """
 
-    def slice_for_tp_transfer(
+    def _slice_for_tp_transfer(
         self, cache: torch.Tensor, *args, **kwargs
-    ) -> list[torch.Tensor]:
+    ) -> list[TPShard]:
         assert isinstance(self, AttentionSpec)
         (k_data, v_data), (k_scale, v_scale), layout = _nvfp4_kv_views(
             cache, self.num_kv_heads
         )
         return [
-            sliced
-            for view in (k_data, k_scale, v_data, v_scale)
-            for sliced in super().slice_for_tp_transfer(  # type: ignore[misc]
+            TPShard(
+                key=(component, *shard.key),
+                view=shard.view,
+                span=shard.span,
+            )
+            for component, view in zip(
+                ("k_data", "k_scale", "v_data", "v_scale"),
+                (k_data, k_scale, v_data, v_scale),
+                strict=True,
+            )
+            for shard in super()._slice_for_tp_transfer(  # type: ignore[misc]
                 view if layout == "HND" else view.transpose(1, 2), *args, **kwargs
             )
         ]

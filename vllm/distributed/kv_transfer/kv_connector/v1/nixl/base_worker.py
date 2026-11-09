@@ -82,6 +82,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     RemoteTransferInfo,
     SlidingWindowMLASpec,
+    TPPlacement,
     UniformTypeKVCacheSpecs,
     compute_layer_kv_cache_shape_bytes,
 )
@@ -225,25 +226,15 @@ class NixlBaseConnectorWorker:
 
             ranges_by_rank: dict[int, list[tuple[int, int, int]]] = {}
             for rank in range(remote_tp_size):
-                views = spec.slice_for_tp_transfer(
+                paired_views = spec.slice_for_tp_transfer(
                     block,
-                    tp_size,
-                    tp_rank,
+                    TPPlacement(tp_size, tp_rank),
                     remote_spec,
-                    remote_tp_size,
-                    rank,
+                    remote_block,
+                    TPPlacement(remote_tp_size, rank),
                     receiving=receiving,
                 )
-                remote_views = remote_spec.slice_for_tp_transfer(
-                    remote_block,
-                    remote_tp_size,
-                    rank,
-                    spec,
-                    tp_size,
-                    tp_rank,
-                    receiving=not receiving,
-                )
-                if not views:
+                if not paired_views:
                     continue
                 if remote_spec == spec:
                     # Both sides hold the same block: move it whole, padding
@@ -262,8 +253,10 @@ class NixlBaseConnectorWorker:
                     )
                 ranges_by_rank[rank] = [
                     byte_range
-                    for view, remote_view in zip(views, remote_views, strict=True)
-                    for byte_range in contiguous_byte_ranges(view, remote_view)
+                    for paired in paired_views
+                    for byte_range in contiguous_byte_ranges(
+                        paired.local, paired.remote
+                    )
                 ]
 
             if ranges_by_rank and remote is not None:
@@ -1194,7 +1187,12 @@ class NixlBaseConnectorWorker:
         )
         senders = set[int]().union(
             *self._tp_byte_ranges(
-                metadata, list(regions), remote_tp_size, 1, 1, receiving=True
+                metadata,
+                list(regions),
+                remote_tp_size,
+                1,
+                1,
+                receiving=True,
             )
         )
         self._push_senders[metadata.engine_id][remote_pp_rank] = len(senders)
