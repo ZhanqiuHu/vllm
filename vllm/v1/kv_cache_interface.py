@@ -25,6 +25,9 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
     from vllm.v1.attention.backend import MultipleOf
 
 logger = init_logger(__name__)
@@ -372,6 +375,23 @@ class KVCacheSpec:
             f"{type(self).__name__} does not support heterogeneous TP transfers."
         )
 
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> KVCacheSpec:
+        """Rebuild the peer ``KVCacheSpec`` used as ``other_spec`` for TP slice.
+
+        ``handshake`` is peer engine handshake metadata. Typed as
+        ``NixlAgentMetadata`` under ``TYPE_CHECKING`` only (no runtime import).
+        Overrides read only the fields their cache type needs. Default: peer
+        is this spec.
+        """
+        return self
+
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
     """View a kernel-block-granular layer cache with manager blocks as dim 0.
@@ -653,6 +673,23 @@ class AttentionSpec(KVCacheSpec):
             f"{type(self).__name__} with {self.num_head_slots} head slots cannot "
             "be sliced by KV head."
         )
+
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> AttentionSpec:
+        """Scale this Attention spec to the peer's KV heads on the handshake."""
+        remote_heads = handshake.layer_num_kv_heads.get(layer_name)
+        if remote_heads is None or remote_heads == self.num_kv_heads:
+            return self
+        slots = self.num_head_slots and (
+            self.num_head_slots * remote_heads // self.num_kv_heads
+        )
+        return replace(self, num_kv_heads=remote_heads, num_head_slots=slots)
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1270,6 +1307,27 @@ class MambaSpec(KVCacheSpec):
                     views.append(pages[:, first : first + (stop - start) * row_bytes])
                 offset += size * row_bytes
         return views
+
+    def reconstruct_peer_spec_from_handshake(
+        self,
+        handshake: NixlAgentMetadata,
+        *,
+        layer_name: str,
+        local_tp_size: int,
+        remote_tp_size: int,
+    ) -> MambaSpec:
+        """Scale sharded Mamba leading dims to the peer's TP width.
+
+        Mamba does not read Attention handshake fields; only TP sizes matter
+        for today's rebuild (shapes are not on the wire yet).
+        """
+        if local_tp_size == remote_tp_size or self.tp_replicated:
+            return self
+        shapes = tuple(
+            (shape[0] * local_tp_size // remote_tp_size, *shape[1:])
+            for shape in self.shapes
+        )
+        return replace(self, shapes=shapes, page_size_padded=None)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":

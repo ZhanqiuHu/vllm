@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
@@ -193,29 +193,12 @@ class NixlBaseConnectorWorker:
             spec = self._layer_specs[name]
             # The remote's spec, scaled from ours.
             # TODO: use the specs the remote advertises (#61452).
-            remote_spec = spec
-            remote_heads = nixl_agent_meta.layer_num_kv_heads.get(name)
-            if (
-                isinstance(spec, AttentionSpec)
-                and remote_heads is not None
-                and remote_heads != spec.num_kv_heads
-            ):
-                slots = spec.num_head_slots and (
-                    spec.num_head_slots * remote_heads // spec.num_kv_heads
-                )
-                remote_spec = replace(
-                    spec, num_kv_heads=remote_heads, num_head_slots=slots
-                )
-            elif (
-                isinstance(spec, MambaSpec)
-                and tp_size != remote_tp_size
-                and not spec.tp_replicated
-            ):
-                shapes = tuple(
-                    (shape[0] * tp_size // remote_tp_size, *shape[1:])
-                    for shape in spec.shapes
-                )
-                remote_spec = replace(spec, shapes=shapes, page_size_padded=None)
+            remote_spec = spec.reconstruct_peer_spec_from_handshake(
+                nixl_agent_meta,
+                layer_name=name,
+                local_tp_size=tp_size,
+                remote_tp_size=remote_tp_size,
+            )
 
             ssm = _is_ssm_spec(self._group_spec_types[group])
             ratio = 1 if ssm else block_size_ratio
