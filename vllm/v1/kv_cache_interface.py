@@ -465,9 +465,8 @@ class KVCacheSpec:
     ) -> tuple[list[int], list[int]]:
         """Map request block ids using general local/remote engine info.
 
-        Default: identity — this cache type does not nest pages across engines
-        (e.g. Mamba). Attention overrides using ``local.block_size`` /
-        ``remote.block_size``.
+        Default: identity — one remote page per local page (e.g. Mamba).
+        Attention overrides using ``local.block_size`` / ``remote.block_size``.
         """
         return list(local_block_ids), list(remote_block_ids)
 
@@ -1277,7 +1276,7 @@ class CircularBufferSpec(AttentionSpec):
         local: LocalTransferInfo,
         remote: RemoteTransferInfo,
     ) -> tuple[list[int], list[int]]:
-        """Ring slots are not an engine token-page lattice — never nest."""
+        """Ring slots are not an engine token-page lattice — always 1:1."""
         del local, remote
         return list(local_block_ids), list(remote_block_ids)
 

@@ -204,7 +204,7 @@ class NixlBaseConnectorWorker:
             # Peer bag from handshake (caller registers before this).
             assert self.transfer_topo is not None
             remote_info = self.transfer_topo.get_engine_info(nixl_agent_meta.engine_id)
-            ratio = self._page_nest_for_group(group, local_info, remote_info)
+            ratio = self._remote_pages_per_local_page(group, local_info, remote_info)
             block_len = self.block_len_per_layer[local] // ratio
             blocks = []
             for side_spec in (spec, remote_spec):
@@ -1889,9 +1889,12 @@ class NixlBaseConnectorWorker:
             local_info = self._require_local_transfer_info()
             assert self.transfer_topo is not None
             remote_info = self.transfer_topo.get_engine_info(engine_id)
-            # Attention nest == block_size_ratio; Mamba map nest stays 1.
-            nest = self._page_nest_for_group(group, local_info, remote_info)
-            if nest == 1 and block_size_ratio > 1:
+            # Attention: remote pages per local page == engine block_size_ratio.
+            # Mamba: remote pages per local page stays 1 (whole state page).
+            remote_pages_per_local_page = self._remote_pages_per_local_page(
+                group, local_info, remote_info
+            )
+            if remote_pages_per_local_page == 1 and block_size_ratio > 1:
                 ratio, split = 1, 1
             else:
                 ratio, split = block_size_ratio, remote_split
@@ -2662,10 +2665,12 @@ class NixlBaseConnectorWorker:
                 for g, local_group in enumerate(meta.local_physical_block_ids):
                     if not local_group:
                         continue
-                    # Mamba map nest stays 1 under engine ratio > 1 — skip.
+                    # Mamba: 1 remote page per local page under engine ratio > 1
+                    # — skip FA sub-block postprocess.
                     if (
                         block_size_ratio > 1
-                        and self._page_nest_for_group(g, local_ti, remote_info) == 1
+                        and self._remote_pages_per_local_page(g, local_ti, remote_info)
+                        == 1
                     ):
                         continue
                     # Number of remote-sized sub-blocks the transfer covered;
@@ -2935,13 +2940,13 @@ class NixlBaseConnectorWorker:
         )
         return self._local_transfer_info
 
-    def _page_nest_for_group(
+    def _remote_pages_per_local_page(
         self,
         group: int,
         local: LocalTransferInfo,
         remote: RemoteTransferInfo,
     ) -> int:
-        """Remote pages per local engine page for this group, via ``map``."""
+        """Number of remote pages per local page for this group, via ``map``."""
         if remote.block_size <= 0 or local.block_size % remote.block_size != 0:
             return 1
         units = local.block_size // remote.block_size
@@ -2961,8 +2966,9 @@ class NixlBaseConnectorWorker:
     ) -> tuple[BlockIds, BlockIds]:
         """Map per-group block ids via each group's ``map_transfer_units``.
 
-        Consumes general local/remote engine info. Attention nests by
-        ``local.block_size // remote.block_size``; Mamba stays identity.
+        Consumes general local/remote engine info. Attention uses
+        ``local.block_size // remote.block_size`` remote pages per local page;
+        Mamba stays identity.
 
         ex: remote (prefill) block ids with block_size 4:
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
