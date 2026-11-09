@@ -1157,9 +1157,17 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     )
     from vllm.v1.kv_cache_interface import MambaSpec
 
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((8, 16),),
+        dtypes=(torch.float16,),
+    )
     worker = MagicMock(spec=NixlConnectorWorker)
+    worker._group_specs = (attn, mamba)
     worker._group_spec_types = (FullAttentionSpec, MambaSpec)
-    _bind_worker_method(worker, "get_mapped_blocks")
     _bind_worker_method(worker, "_map_block_ids_for_block_size_ratio")
 
     local, remote = worker._map_block_ids_for_block_size_ratio(
@@ -1172,6 +1180,7 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     assert remote == [list(range(30, 40)), [42]]
 
     # Attention-only full prefix hit: empty local list is preserved.
+    worker._group_specs = (attn,)
     worker._group_spec_types = (FullAttentionSpec,)
     local, remote = worker._map_block_ids_for_block_size_ratio([[]], [[30, 31]], 4)
     assert local == []

@@ -924,7 +924,13 @@ class NixlBaseConnectorWorker:
         self._physical_blocks_per_group = [1] * len(kv_cache_config.transfer_groups)
         self._logical_num_blocks = self.num_blocks
 
-        # Unwrap UniformTypeKVCacheSpecs to get the representative spec type
+        # Unwrap UniformTypeKVCacheSpecs to the representative spec / type.
+        self._group_specs = tuple(
+            next(iter(g.kv_cache_spec.kv_cache_specs.values()))
+            if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else g.kv_cache_spec
+            for g in self.kv_cache_config.transfer_groups
+        )
         self._group_spec_types = tuple(
             get_representative_spec_type(g.kv_cache_spec)
             for g in self.kv_cache_config.transfer_groups
@@ -2906,13 +2912,12 @@ class NixlBaseConnectorWorker:
         remote_block_ids: BlockIds,
         block_size_ratio: int,
     ) -> tuple[BlockIds, BlockIds]:
-        """Map attention-group block ids to remote-block granularity.
+        """Map per-group block ids via each group's ``map_transfer_units``.
 
-        Each local attention block is split into ``block_size_ratio``
-        sub-blocks paired 1:1 with remote blocks. Sub-blocks beyond the
-        remote list — the untransferred tail of the last local block — are
-        clipped here and zeroed in the receive post-process. Mamba state
-        blocks are indivisible and transfer 1:1, unexpanded.
+        ``block_size_ratio`` is topo ``local_page_size // remote_page_size``.
+        Passed as page sizes ``(block_size_ratio, 1)`` so Attention nests by
+        that factor and atomic specs (e.g. Mamba) keep identity — no type
+        sniff in the connector.
 
         ex: remote (prefill) block ids with block_size 4:
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -2923,17 +2928,14 @@ class NixlBaseConnectorWorker:
         mapped_remote: list[list[int]] = []
         for i, remote_group in enumerate(remote_block_ids):
             local_group = local_block_ids[i] if local_block_ids else []
-            if _is_ssm_spec(self._group_spec_types[i]):
-                mapped_local.append(list(local_group))
-                mapped_remote.append(list(remote_group))
-                continue
-            mapped = self.get_mapped_blocks(
-                np.asarray(local_group), block_size_ratio
-            ).tolist()
-            if len(mapped) > len(remote_group):
-                mapped = mapped[: len(remote_group)]
-            mapped_local.append(mapped)
-            mapped_remote.append(list(remote_group))
+            loc, rem = self._group_specs[i].map_transfer_units(
+                local_group,
+                remote_group,
+                local_page_size=block_size_ratio,
+                remote_page_size=1,
+            )
+            mapped_local.append(loc)
+            mapped_remote.append(rem)
         if not any(mapped_local):
             # Full prefix cache hit is indicated with an empty list.
             return [], mapped_remote

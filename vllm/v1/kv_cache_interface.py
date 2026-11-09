@@ -401,6 +401,22 @@ class KVCacheSpec:
         """
         return self
 
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        *,
+        local_page_size: int,
+        remote_page_size: int,
+    ) -> tuple[list[int], list[int]]:
+        """Map request block ids when local and peer page sizes may differ.
+
+        ``local_page_size`` / ``remote_page_size`` are page granules in the same
+        unit (typically tokens per page). Default: identity — pages are atomic
+        and do not nest across engines (e.g. Mamba). Attention overrides.
+        """
+        return list(local_block_ids), list(remote_block_ids)
+
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
     """View a kernel-block-granular layer cache with manager blocks as dim 0.
@@ -703,6 +719,35 @@ class AttentionSpec(KVCacheSpec):
             self.num_head_slots * remote_heads // self.num_kv_heads
         )
         return replace(self, num_kv_heads=remote_heads, num_head_slots=slots)
+
+    def map_transfer_units(
+        self,
+        local_block_ids: Sequence[int],
+        remote_block_ids: Sequence[int],
+        *,
+        local_page_size: int,
+        remote_page_size: int,
+    ) -> tuple[list[int], list[int]]:
+        """Expand local Attention block ids onto the peer page lattice.
+
+        One local page spans ``local_page_size // remote_page_size`` peer pages.
+        Expanded ids past ``remote_block_ids`` are clipped.
+        """
+        if remote_page_size <= 0 or local_page_size % remote_page_size != 0:
+            raise ValueError(
+                f"Local page size {local_page_size} is not divisible "
+                f"by remote page size {remote_page_size}."
+            )
+        units = local_page_size // remote_page_size
+        if units == 1:
+            return list(local_block_ids), list(remote_block_ids)
+        expanded: list[int] = []
+        for local_id in local_block_ids:
+            start = local_id * units
+            expanded.extend(range(start, start + units))
+        if len(expanded) > len(remote_block_ids):
+            expanded = expanded[: len(remote_block_ids)]
+        return expanded, list(remote_block_ids)
 
     @property
     def state_content_size_bytes(self) -> int:
