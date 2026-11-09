@@ -1787,6 +1787,10 @@ def _layer_routing_worker(
 def _prep_whole_blocks(worker, metadata, pairs, base_addresses) -> list[np.ndarray]:
     """Prepare desc lists moving every paired block whole with remote rank 0,
     and return them expanded to one row per block."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import LocalTransferInfo
+
     engine_id = metadata.engine_id
     num_remote = len(metadata.kv_caches_base_addr)
     worker._dst_pairs[engine_id] = pairs
@@ -1805,6 +1809,18 @@ def _prep_whole_blocks(worker, metadata, pairs, base_addresses) -> list[np.ndarr
     worker.device_id = 0
     worker._mixed_mem_types = False
     worker.region_mem_types = ["VRAM"] * len(base_addresses)
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id=worker.engine_id,
+        tp_size=1,
+        tp_rank=0,
+        block_size=worker.block_size,
+    )
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        tp_size=1,
+        block_size=metadata.block_size,
+        block_len=metadata.block_lens[0],
+        dcp_size=1,
+    )
     lists: list[np.ndarray] = []
 
     def prep_xfer_dlist(agent, descs, **_) -> int:

@@ -1503,12 +1503,23 @@ def test_csa_linear_ple_moves_whole_from_one_rank(ple_page_size):
     """Pulling from two P ranks, the replicated PLE block is read whole from one
     of them, even when wider than the block it shares a base with, while the
     sharded Mamba state is read half from each."""
+    from vllm.v1.kv_cache_interface import RemoteTransferInfo
+
     worker = _make_csa_linear_ple_worker(ple_page_size=ple_page_size)
     metadata = msgspec.msgpack.decode(
         worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
     )
     pairs = worker._pair_regions(metadata)
     worker._select_remote_regions(metadata, pairs.remote_regions)
+    # This test reuses local handshake meta as the "peer"; inject the peer bag
+    # directly (register_remote_engine rejects engine_id == local).
+    assert worker.transfer_topo is not None
+    worker.transfer_topo._engines[(metadata.engine_id, 0)] = RemoteTransferInfo(
+        tp_size=2,
+        block_size=metadata.block_size,
+        block_len=metadata.block_lens[0],
+        dcp_size=1,
+    )
     regions = list(zip(pairs.local, pairs.group, pairs.remote))
     ranges = dict(
         zip(pairs.group, worker._tp_byte_ranges(metadata, regions, 2, 1, 1, True))
