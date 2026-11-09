@@ -360,12 +360,11 @@ class KVCacheSpec:
     ) -> list[torch.Tensor]:
         """Views of ``cache`` moved between this rank and another TP rank.
 
-        ``cache`` is this rank's ``[B, H, N, C]`` view of one layer's cache,
-        real or on the meta device. The other rank's call, given this rank as
-        its peer and the opposite ``receiving``, returns views of the same
-        shapes in the same order, so the two lists pair up for transfer.
-        Empty when the pair moves nothing, so the other rank is not a source
-        (or destination) of this one.
+        ``cache`` is this rank's registered page view (Attention typically
+        ``[B, H, N, C]``; Mamba ``[B, 1, 1, C]``), real or on the meta device.
+        The other rank's call, given this rank as its peer and the opposite
+        ``receiving``, returns views of the same shapes in the same order, so
+        the two lists pair up for transfer. Empty when the pair moves nothing.
         """
         if tp_size == other_tp_size and tp_rank == other_tp_rank:
             return [cache]
@@ -416,51 +415,6 @@ class KVCacheSpec:
         and do not nest across engines (e.g. Mamba). Attention overrides.
         """
         return list(local_block_ids), list(remote_block_ids)
-
-    def overlap_view_shape(
-        self,
-        registered_block_bytes: int,
-        *,
-        local_block_tokens: int,
-        remote_block_tokens: int,
-        physical_blocks: int,
-    ) -> tuple[tuple[int, int, int, int], int]:
-        """Logical overlap-view shape, and the registered byte length at that grain.
-
-        A token page divides ``registered_block_bytes`` by
-        ``local_block_tokens // remote_block_tokens``. The logical
-        ``(1, H, N, C)`` shape is used when this spec can describe one; otherwise
-        the view is an opaque row of that byte length. ``block_bytes`` can be
-        larger than the logical shape when the registered block is padded or
-        packs other layers.
-        """
-        if remote_block_tokens <= 0 or local_block_tokens % remote_block_tokens != 0:
-            raise ValueError(
-                f"Local block tokens {local_block_tokens} are not divisible "
-                f"by remote block tokens {remote_block_tokens}."
-            )
-        return self._overlap_view_shape(
-            registered_block_bytes,
-            units=local_block_tokens // remote_block_tokens,
-            physical_blocks=physical_blocks,
-        )
-
-    def _overlap_view_shape(
-        self,
-        registered_block_bytes: int,
-        *,
-        units: int,
-        physical_blocks: int,
-    ) -> tuple[tuple[int, int, int, int], int]:
-        block_bytes = registered_block_bytes // units
-        shape: tuple[int, int, int, int] = (1, 1, 1, block_bytes)
-        try:
-            tokens = self.block_size // (physical_blocks * units)
-            logical = compute_layer_kv_cache_shape_bytes(self, 1, tokens)
-            shape = (1, logical[1], logical[2], logical[3])
-        except (NotImplementedError, AttributeError):
-            pass
-        return shape, block_bytes
 
 
 def group_kernel_blocks(cache: torch.Tensor, num_blocks: int) -> torch.Tensor:
@@ -1411,15 +1365,6 @@ class MambaSpec(KVCacheSpec):
                 offset += size * row_bytes
         return views
 
-    def peer_handshake_fields(self) -> Mapping[str, Any]:
-        """Mamba peer rebuild still uses TP sizes only (no fields on the wire).
-
-        Explicit empty publish so callers do not assume only Attention
-        implements this hook. Future: shapes / tp_replicated here once
-        reconstruct reads them from peer_spec_fields_by_layer.
-        """
-        return {}
-
     def reconstruct_peer_spec_from_handshake(
         self,
         handshake: NixlAgentMetadata,
@@ -1436,26 +1381,6 @@ class MambaSpec(KVCacheSpec):
             for shape in self.shapes
         )
         return replace(self, shapes=shapes, page_size_padded=None)
-
-    def overlap_view_shape(
-        self,
-        registered_block_bytes: int,
-        *,
-        local_block_tokens: int,
-        remote_block_tokens: int,
-        physical_blocks: int,
-    ) -> tuple[tuple[int, int, int, int], int]:
-        """A Mamba state page is not divided by a peer token page.
-
-        The logical shape is still attempted at ``units=1``, matching a state
-        block that moves whole.
-        """
-        del local_block_tokens, remote_block_tokens
-        return self._overlap_view_shape(
-            registered_block_bytes,
-            units=1,
-            physical_blocks=physical_blocks,
-        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "align":
