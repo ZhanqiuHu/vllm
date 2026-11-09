@@ -35,7 +35,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 from vllm.v1.attention.backends.gdn_attn import GDNSpec
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -809,10 +808,10 @@ def _make_remote_meta(
         region_members=worker.region_members,
         region_group_ids=region_group_ids,
         layer_group_ids=layer_group_ids,
-        layer_num_kv_heads={
-            name: spec.num_kv_heads
+        peer_spec_fields_by_layer={
+            name: dict(spec.peer_handshake_fields())
             for name, spec in worker._layer_specs.items()
-            if isinstance(spec, AttentionSpec)
+            if spec.peer_handshake_fields()
         },
     )
 

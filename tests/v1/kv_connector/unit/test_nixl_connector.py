@@ -663,7 +663,9 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     region_group_ids=self.region_group_ids,
                     region_mem_types=self.region_mem_types,
                     region_members=self.region_members,
-                    layer_num_kv_heads={"layer0": remote_heads},
+                    peer_spec_fields_by_layer={
+                        "layer0": {"num_kv_heads": remote_heads}
+                    },
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -736,8 +738,12 @@ def _advertise_one_layer_per_region(worker, *metas: NixlAgentMetadata) -> None:
             )
     for meta in metas:
         meta.region_members = region_layers
-        meta.layer_num_kv_heads = {
-            name: max(1, worker._layer_specs[name].num_kv_heads * remote // local)
+        meta.peer_spec_fields_by_layer = {
+            name: {
+                "num_kv_heads": max(
+                    1, worker._layer_specs[name].num_kv_heads * remote // local
+                )
+            }
             for (name,), local, remote in zip(
                 region_layers, worker.block_len_per_layer, meta.block_lens
             )
@@ -1495,7 +1501,7 @@ class TestNixlHandshake:
             )
             _advertise_one_layer_per_region(worker2, bad_meta)
             # The remote's MLA layer still holds its one latent head.
-            bad_meta.layer_num_kv_heads["layer2"] = 1
+            bad_meta.peer_spec_fields_by_layer["layer2"] = {"num_kv_heads": 1}
             with pytest.raises(ValueError, match="has blocks of"):
                 worker2.add_remote_agent(bad_meta, remote_tp_size=1)
 
@@ -1795,7 +1801,7 @@ class TestNixlHandshake:
                 physical_blocks_per_group=[1],
             )
             _advertise_one_layer_per_region(worker, bad_meta)
-            bad_meta.layer_num_kv_heads = {"layer0": 16}
+            bad_meta.peer_spec_fields_by_layer = {"layer0": {"num_kv_heads": 16}}
 
             with pytest.raises(ValueError, match="spec there needs"):
                 worker.add_remote_agent(bad_meta, remote_tp_size=2)

@@ -145,10 +145,10 @@ def _remote_meta(worker: NixlConnectorWorker, remote_tp_size: int) -> NixlAgentM
         attn_backend_name="",
         physical_blocks_per_group=[1] * len(remote_specs),
         region_members=worker.region_members,
-        layer_num_kv_heads={
-            name: spec.num_kv_heads
+        peer_spec_fields_by_layer={
+            name: dict(spec.peer_handshake_fields())
             for name, spec in zip(worker._layer_specs, remote_specs, strict=True)
-            if isinstance(spec, AttentionSpec)
+            if spec.peer_handshake_fields()
         },
     )
 

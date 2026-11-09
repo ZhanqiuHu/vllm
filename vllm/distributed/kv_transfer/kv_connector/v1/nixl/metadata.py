@@ -57,8 +57,10 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  18: Register Mamba state as regions like any other; replace
 #      physical_blocks_per_logical_kv_block, ssm_sizes and ple_block_len with
 #      physical_blocks_per_group
+#  19: Replace Attention-only layer_num_kv_heads with type-neutral
+#      peer_spec_fields_by_layer (from KVCacheSpec.peer_handshake_fields)
 #
-NIXL_CONNECTOR_VERSION: int = 18
+NIXL_CONNECTOR_VERSION: int = 19
 
 
 @dataclass
@@ -87,8 +89,12 @@ class NixlAgentMetadata:
     layer_group_ids: dict[str, int] = field(default_factory=dict)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
-    # KV heads of each attention layer on this rank, to rebuild its spec.
-    layer_num_kv_heads: dict[str, int] = field(default_factory=dict)
+    # Per layer name: cache-type-specific fields used only to reconstruct that
+    # layer's peer KVCacheSpec for TP transfer. Populated from
+    # KVCacheSpec.peer_handshake_fields() (e.g. Attention: {"num_kv_heads": N};
+    # Mamba may omit an entry or publish its own keys later). Not a general
+    # dump of the full spec — only the rebuild inputs the peer needs.
+    peer_spec_fields_by_layer: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

@@ -1763,10 +1763,10 @@ class NixlBaseConnectorWorker:
                 for name in names
             },
             packed_member_layouts=self._packed_member_layouts,
-            layer_num_kv_heads={
-                name: spec.num_kv_heads
+            peer_spec_fields_by_layer={
+                name: fields
                 for name, spec in self._layer_specs.items()
-                if isinstance(spec, AttentionSpec)
+                if (fields := dict(spec.peer_handshake_fields()))
             },
         )
         # Wrap metadata in payload with hash for defensive decoding

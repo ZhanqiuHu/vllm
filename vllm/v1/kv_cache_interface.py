@@ -6,13 +6,13 @@ from __future__ import annotations
 import copy
 import math
 from collections import Counter
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from functools import cached_property
 from math import prod
-from typing import TYPE_CHECKING, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Self, TypeVar
 
 import torch
 
@@ -375,6 +375,15 @@ class KVCacheSpec:
             f"{type(self).__name__} does not support heterogeneous TP transfers."
         )
 
+    def peer_handshake_fields(self) -> Mapping[str, Any]:
+        """Cache-type fields this layer contributes to peer handshake metadata.
+
+        Default: nothing. Subclasses add only fields their type needs (e.g.
+        Attention publishes ``num_kv_heads``). Connectors aggregate these
+        without ``isinstance`` on concrete spec types.
+        """
+        return {}
+
     def reconstruct_peer_spec_from_handshake(
         self,
         handshake: NixlAgentMetadata,
@@ -674,6 +683,9 @@ class AttentionSpec(KVCacheSpec):
             "be sliced by KV head."
         )
 
+    def peer_handshake_fields(self) -> Mapping[str, Any]:
+        return {"num_kv_heads": self.num_kv_heads}
+
     def reconstruct_peer_spec_from_handshake(
         self,
         handshake: NixlAgentMetadata,
@@ -683,7 +695,8 @@ class AttentionSpec(KVCacheSpec):
         remote_tp_size: int,
     ) -> AttentionSpec:
         """Scale this Attention spec to the peer's KV heads on the handshake."""
-        remote_heads = handshake.layer_num_kv_heads.get(layer_name)
+        fields = handshake.peer_spec_fields_by_layer.get(layer_name) or {}
+        remote_heads = fields.get("num_kv_heads")
         if remote_heads is None or remote_heads == self.num_kv_heads:
             return self
         slots = self.num_head_slots and (
@@ -1308,6 +1321,15 @@ class MambaSpec(KVCacheSpec):
                 offset += size * row_bytes
         return views
 
+    def peer_handshake_fields(self) -> Mapping[str, Any]:
+        """Mamba peer rebuild still uses TP sizes only (no fields on the wire).
+
+        Explicit empty publish so callers do not assume only Attention
+        implements this hook. Future: shapes / tp_replicated here once
+        reconstruct reads them from peer_spec_fields_by_layer.
+        """
+        return {}
+
     def reconstruct_peer_spec_from_handshake(
         self,
         handshake: NixlAgentMetadata,
@@ -1316,11 +1338,7 @@ class MambaSpec(KVCacheSpec):
         local_tp_size: int,
         remote_tp_size: int,
     ) -> MambaSpec:
-        """Scale sharded Mamba leading dims to the peer's TP width.
-
-        Mamba does not read Attention handshake fields; only TP sizes matter
-        for today's rebuild (shapes are not on the wire yet).
-        """
+        """Scale sharded Mamba leading dims to the peer's TP width."""
         if local_tp_size == remote_tp_size or self.tp_replicated:
             return self
         shapes = tuple(
