@@ -83,7 +83,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
-    compute_layer_kv_cache_shape_bytes,
 )
 
 if TYPE_CHECKING:
@@ -200,25 +199,27 @@ class NixlBaseConnectorWorker:
                 remote_tp_size=remote_tp_size,
             )
 
+            # Page grain for the checks below. View shapes come from the spec.
             ssm = _is_ssm_spec(self._group_spec_types[group])
             ratio = 1 if ssm else block_size_ratio
-            block_len = self.block_len_per_layer[local] // ratio
-            blocks = []
-            for side_spec in (spec, remote_spec):
-                # One [1, H, N, C] block of bytes, or one opaque row.
-                shape: tuple[int, ...] = (1, 1, 1, block_len)
-                with contextlib.suppress(NotImplementedError, AttributeError):
-                    tokens = side_spec.block_size // (
-                        self._physical_blocks_per_group[group] * ratio
-                    )
-                    shape = (
-                        1,
-                        *compute_layer_kv_cache_shape_bytes(side_spec, 1, tokens)[1:],
-                    )
-                blocks.append(
-                    torch.empty_permuted(shape, layout, dtype=torch.int8, device="meta")
-                )
-            block, remote_block = blocks
+            registered = self.block_len_per_layer[local]
+            physical = self._physical_blocks_per_group[group]
+            shape, block_len = spec.overlap_view_shape(
+                registered,
+                local_block_tokens=block_size_ratio,
+                remote_block_tokens=1,
+                physical_blocks=physical,
+            )
+            remote_shape, _ = remote_spec.overlap_view_shape(
+                registered,
+                local_block_tokens=block_size_ratio,
+                remote_block_tokens=1,
+                physical_blocks=physical,
+            )
+            block = torch.empty_permuted(shape, layout, dtype=torch.int8, device="meta")
+            remote_block = torch.empty_permuted(
+                remote_shape, layout, dtype=torch.int8, device="meta"
+            )
 
             ranges_by_rank: dict[int, list[tuple[int, int, int]]] = {}
             for rank in range(remote_tp_size):
