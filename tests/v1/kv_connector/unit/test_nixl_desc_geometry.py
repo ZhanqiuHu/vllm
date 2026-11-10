@@ -11,6 +11,7 @@ incoming transfer can overwrite a co-resident request's KV or mamba state
 mid-decode (silent corruption of an unrelated request).
 """
 
+import contextlib
 import math
 from collections import defaultdict
 from threading import Event, Lock
@@ -1020,7 +1021,6 @@ def test_hetero_ppl_pull_without_remote_num_tokens_fails():
         remote_block_size=8,
         remote_kernel_block_size=4,
         remote_num_logical=12,
-        remote_ssm_sizes=(24, 32),
     )
     _register_remote_agents(worker, meta_r, 2)
 
@@ -1456,7 +1456,6 @@ def test_dcp_rejects_different_logical_block_sizes():
         remote_block_size=8,
         remote_kernel_block_size=4,
         remote_num_logical=12,
-        remote_ssm_sizes=(24, 32),
     )
     with pytest.raises(NotImplementedError, match="matching P/D logical block sizes"):
         worker.add_remote_agent(
@@ -1481,7 +1480,6 @@ def test_dcp_pull_with_block_size_ratio_writes_stay_within_request_blocks():
         remote_block_size=8,
         remote_kernel_block_size=4,
         remote_num_logical=8,
-        remote_ssm_sizes=(24, 32),
     )
     worker._remote_agents[meta_r.engine_id] = {
         (0, rank): worker.add_remote_agent(

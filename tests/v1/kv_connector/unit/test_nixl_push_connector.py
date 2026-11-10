@@ -37,6 +37,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+    NixlBaseConnectorWorker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
