@@ -14,7 +14,6 @@ from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
-    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -56,10 +55,6 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
     return issubclass(spec_type, AttentionSpec)
-
-
-def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
-    return issubclass(spec_type, MambaSpec)
 
 
 def get_representative_spec_type(spec: KVCacheSpec) -> type[KVCacheSpec]:

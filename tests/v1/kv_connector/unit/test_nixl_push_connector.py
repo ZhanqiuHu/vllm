@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import numpy as np
 import pytest
+import torch
 
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -52,7 +53,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, LocalTransferInfo
 from vllm.v1.outputs import KVConnectorOutput
 
 from .utils import (
@@ -376,7 +377,20 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._desc_starts = defaultdict(dict)
         w._physical_blocks_per_group = [1]
         w._remote_physical_blocks_per_group = {}
+        w._remote_group_specs = {}
         w._remote_block_splits = {}
+        w.block_size = 16
+        w._group_specs = (
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+            ),
+        )
+        w._local_transfer_info = LocalTransferInfo(
+            engine_id="test-decode-engine",
+            tp_size=1,
+            tp_rank=0,
+            block_size=16,
+        )
         w._push_senders = defaultdict(dict)
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
@@ -635,7 +649,9 @@ class TestPushWriterStartLoadKv:
         # Stub heartbeats to a no-op; tests don't exercise the heartbeat
         # path here.
         w._send_heartbeats = lambda metadata: None
-        # Stub logical-to-kernel mapping used by reqs_to_recv.
+        # Stub id expand used by reqs_to_recv / push WRITE.
+        w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+        w._remote_transfer_unit_ids = lambda engine, ids: ids
         w._logical_to_kernel_block_ids = lambda x, ratio: x
 
         meta = NixlConnectorMetadata()
@@ -690,6 +706,8 @@ def test_do_start_push_kv_defers_then_writes_when_handshake_ready():
     re-drive with the handshake ready the WRITE is issued with a correct
     ReqMeta."""
     w = _StubWriterWorker.fresh()
+    w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+    w._remote_transfer_unit_ids = lambda engine, ids: ids
     w._logical_to_kernel_block_ids = lambda x, ratio: x
     xfer_calls: list[dict[str, Any]] = []
     w._xfer_blocks_for_req = lambda **kw: xfer_calls.append(kw)
@@ -730,6 +748,8 @@ def test_do_start_push_kv_drops_request_on_handshake_failure():
     the failure is logged. Blocks are reclaimed by the lease/watchdog, matching
     the old blocking behaviour."""
     w = _StubWriterWorker.fresh()
+    w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+    w._remote_transfer_unit_ids = lambda engine, ids: ids
     w._logical_to_kernel_block_ids = lambda x, ratio: x
     xfer_calls: list[dict[str, Any]] = []
     w._xfer_blocks_for_req = lambda **kw: xfer_calls.append(kw)
@@ -800,6 +820,8 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w.dst_num_blocks = {}
     w.source_ranks = {}
     w.transfer_topo = None
+    w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+    w._remote_transfer_unit_ids = lambda engine, ids: ids
     w._logical_to_kernel_block_ids = lambda blocks, ratio: blocks
     w.writes = []
     w._xfer_blocks_for_req = lambda req_id, meta: w.writes.append(req_id)
@@ -888,6 +910,8 @@ def test_start_load_kv_refreshes_engine_last_active_on_d_side():
     mid-stream once it passes its TTL."""
     w = _StubWriterWorker.fresh()
     w._send_heartbeats = lambda metadata: None
+    w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+    w._remote_transfer_unit_ids = lambda engine, ids: ids
     w._logical_to_kernel_block_ids = lambda x, ratio: x
     # Connected prefill engine (already handshaked in).
     w._remote_agents["prefill-engine"] = {(0, 0): "agent-p"}
@@ -964,8 +988,24 @@ class TestPushWriterNotifs:
     def _pollable_worker() -> _StubWriterWorker:
         """Stub worker with the extra base-worker state the real
         ``get_transfer_results`` needs to poll ``_sending_transfers``."""
+        from types import SimpleNamespace
+
         w = _StubWriterWorker.fresh()
         w.transfer_topo = MagicMock()
+        w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+            tp_size=1,
+            block_size=w.block_size,
+            block_len=0,
+            dcp_size=1,
+        )
+        w._local_transfer_info = LocalTransferInfo(
+            engine_id=w.engine_id,
+            tp_size=1,
+            tp_rank=0,
+            block_size=w.block_size,
+        )
+        w._physical_blocks_per_group = [1]
+        w._remote_physical_blocks_per_group = {w.engine_id: [1]}
         w.nixl_wrapper = MagicMock()
         w.xfer_stats = MagicMock()
         w._log_failure = MagicMock()  # type: ignore[method-assign]
@@ -1358,6 +1398,8 @@ class TestPushWriterNegative:
         """Empty metadata must not wake the writer or enqueue anything."""
         w = _StubWriterWorker.fresh()
         w._send_heartbeats = lambda metadata: None
+        w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+        w._remote_transfer_unit_ids = lambda engine, ids: ids
         w._logical_to_kernel_block_ids = lambda x, ratio: x
 
         meta = NixlConnectorMetadata()
@@ -1513,9 +1555,13 @@ class TestPushWriterMlaReplication:
         w.nixl_wrapper = MagicMock()
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_tp_size=len(d_ranks),
-            remote_block_size=16,
-            remote_physical_blocks_per_logical=1,
+            tp_size=len(d_ranks),
+            block_size=16,
+            block_len=0,
+            dcp_size=1,
+        )
+        w._local_transfer_info = LocalTransferInfo(
+            engine_id=w.engine_id, tp_size=1, tp_rank=0, block_size=16
         )
         # The push direction's ranges write the replicated latent to every
         # D rank (see test_tp_mapping).
@@ -1606,9 +1652,13 @@ class TestPushPrefixCaching:
 
         w.transfer_topo = MagicMock()
         w.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-            remote_physical_blocks_per_logical=1,
-            remote_block_size=16,
-            remote_tp_size=1,
+            tp_size=1,
+            block_size=16,
+            block_len=0,
+            dcp_size=1,
+        )
+        w._local_transfer_info = LocalTransferInfo(
+            engine_id=w.engine_id, tp_size=1, tp_rank=0, block_size=16
         )
         w.transfer_topo.tp_ratio.return_value = 1
         w.transfer_topo.block_size_ratio.return_value = 1
@@ -1627,6 +1677,8 @@ class TestPushPrefixCaching:
         w.nixl_wrapper = MagicMock()
         w.nixl_wrapper.make_prepped_xfer.return_value = 7
         w._ensure_handshake = lambda *a, **k: None
+        w._transfer_unit_ids_from_specs = lambda ids, specs: ids
+        w._remote_transfer_unit_ids = lambda engine, ids: ids
         w._logical_to_kernel_block_ids = lambda x, ratio: x
         return w, engine_id
 
@@ -1735,6 +1787,10 @@ def _layer_routing_worker(
 def _prep_whole_blocks(worker, metadata, pairs, base_addresses) -> list[np.ndarray]:
     """Prepare desc lists moving every paired block whole with remote rank 0,
     and return them expanded to one row per block."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import LocalTransferInfo
+
     engine_id = metadata.engine_id
     num_remote = len(metadata.kv_caches_base_addr)
     worker._dst_pairs[engine_id] = pairs
@@ -1753,6 +1809,18 @@ def _prep_whole_blocks(worker, metadata, pairs, base_addresses) -> list[np.ndarr
     worker.device_id = 0
     worker._mixed_mem_types = False
     worker.region_mem_types = ["VRAM"] * len(base_addresses)
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id=worker.engine_id,
+        tp_size=1,
+        tp_rank=0,
+        block_size=worker.block_size,
+    )
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        tp_size=1,
+        block_size=metadata.block_size,
+        block_len=metadata.block_lens[0],
+        dcp_size=1,
+    )
     lists: list[np.ndarray] = []
 
     def prep_xfer_dlist(agent, descs, **_) -> int:

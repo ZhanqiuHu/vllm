@@ -28,7 +28,6 @@ from tests.v1.spec_decode.utils import fake_speculative_config
 from vllm import LLM
 from vllm.config import KVTransferConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import (
-    EngineTransferInfo,
     KVOutputAggregator,
     TransferTopology,
     get_current_attn_backend,
@@ -79,7 +78,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVQuantMode,
+    LocalTransferInfo,
     MLAAttentionSpec,
+    RemoteTransferInfo,
     compute_layer_kv_cache_shape_bytes,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -583,6 +584,14 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             attn_backends=self.attn_backends,
             tensor_shape=test_shape,
         )
+        # Tests that skip register_kv_caches still need the planning bag.
+        self._local_transfer_info = LocalTransferInfo(
+            engine_id=self.engine_id,
+            tp_size=self.world_size,
+            tp_rank=self.tp_rank,
+            block_size=self.block_size,
+            dcp_size=self.dcp_size,
+        )
 
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name
@@ -663,7 +672,9 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     region_group_ids=self.region_group_ids,
                     region_mem_types=self.region_mem_types,
                     region_members=self.region_members,
-                    layer_num_kv_heads={"layer0": remote_heads},
+                    peer_spec_fields_by_layer={
+                        "layer0": {"num_kv_heads": remote_heads}
+                    },
                 ),
                 remote_tp_rank=remote_tp_rank,
                 remote_tp_size=remote_tp_size,
@@ -736,8 +747,12 @@ def _advertise_one_layer_per_region(worker, *metas: NixlAgentMetadata) -> None:
             )
     for meta in metas:
         meta.region_members = region_layers
-        meta.layer_num_kv_heads = {
-            name: max(1, worker._layer_specs[name].num_kv_heads * remote // local)
+        meta.peer_spec_fields_by_layer = {
+            name: {
+                "num_kv_heads": max(
+                    1, worker._layer_specs[name].num_kv_heads * remote // local
+                )
+            }
             for (name,), local, remote in zip(
                 region_layers, worker.block_len_per_layer, meta.block_lens
             )
@@ -1032,7 +1047,7 @@ class TestNixlHandshake:
 
             remote_engine_id = worker.REMOTE_ENGINE_ID
             remote_info = worker.transfer_topo.get_engine_info(remote_engine_id)
-            assert remote_info.remote_tp_size == remote_tp_size
+            assert remote_info.tp_size == remote_tp_size
             assert -tp_ratio == worker.transfer_topo.tp_ratio(remote_tp_size)
             # One local desc list holds a head slice of the block per source.
             local = worker._local_descs[remote_engine_id].handle
@@ -1258,7 +1273,7 @@ class TestNixlHandshake:
         )
 
         # Mock TP world size to 2 to force heterogeneous TP when
-        # remote_tp_size=1
+        # tp_size=1
         with patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=2,
@@ -1323,7 +1338,7 @@ class TestNixlHandshake:
         )
 
         # Mock TP world size to 2 to force heterogeneous TP when
-        # remote_tp_size=1
+        # tp_size=1
         with patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.get_tensor_model_parallel_world_size",  # noqa: E501
             return_value=2,
@@ -1405,6 +1420,14 @@ class TestNixlHandshake:
             region_num_blocks=None,
         )
         _advertise_one_layer_per_region(worker, meta)
+        worker.transfer_topo.register_remote_engine(
+            meta.engine_id,
+            RemoteTransferInfo(
+                tp_size=1,
+                block_size=meta.block_size,
+                block_len=meta.block_lens[0],
+            ),
+        )
 
         # TP 2 rank 1 reads the second half of the TP 1 rank's heads.
         regions = [(0, 0, 0)]
@@ -1495,7 +1518,7 @@ class TestNixlHandshake:
             )
             _advertise_one_layer_per_region(worker2, bad_meta)
             # The remote's MLA layer still holds its one latent head.
-            bad_meta.layer_num_kv_heads["layer2"] = 1
+            bad_meta.peer_spec_fields_by_layer["layer2"] = {"num_kv_heads": 1}
             with pytest.raises(ValueError, match="has blocks of"):
                 worker2.add_remote_agent(bad_meta, remote_tp_size=1)
 
@@ -1795,7 +1818,7 @@ class TestNixlHandshake:
                 physical_blocks_per_group=[1],
             )
             _advertise_one_layer_per_region(worker, bad_meta)
-            bad_meta.layer_num_kv_heads = {"layer0": 16}
+            bad_meta.peer_spec_fields_by_layer = {"layer0": {"num_kv_heads": 16}}
 
             with pytest.raises(ValueError, match="spec there needs"):
                 worker.add_remote_agent(bad_meta, remote_tp_size=2)
@@ -2475,7 +2498,28 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
     worker.region_mem_types = ["DRAM", "VRAM"]
     worker.nixl_memory_type = "VRAM"
     # Both regions move whole 10-byte blocks with remote rank 0.
-    worker._group_spec_types = (FullAttentionSpec,)
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    worker._group_specs = (fa, fa)
+    worker._group_spec_types = (FullAttentionSpec, FullAttentionSpec)
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="local", tp_size=1, tp_rank=0, block_size=16
+    )
+    worker.transfer_topo = TransferTopology(
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        engine_id="local",
+        is_mla=False,
+        is_mamba=False,
+        total_num_kv_heads=1,
+        attn_backends=[],
+    )
+    worker.transfer_topo.register_remote_engine(
+        "P",
+        RemoteTransferInfo(tp_size=1, block_size=16, block_len=10),
+    )
     worker._dst_pairs = {"P": region_pairs_by_index(2)}
     worker._byte_ranges = {"P": [{0: [(0, 0, 10)]}] * 2}
     worker._remote_block_splits = {}
@@ -2516,8 +2560,16 @@ def recv_worker():
     worker.transfer_topo = MagicMock()
     worker.transfer_topo.block_size_ratio.return_value = 1
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
-        remote_block_size=16, remote_physical_blocks_per_logical=1
+        block_size=16, tp_size=1, block_len=0, dcp_size=1
     )
+    worker._remote_physical_blocks_per_group = {}
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="local", tp_size=1, tp_rank=0, block_size=16
+    )
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    worker._group_specs = (fa,)
     worker._physical_blocks_per_logical_kv_block = 1
     worker._physical_blocks_per_group = [1]
     worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
@@ -3752,11 +3804,10 @@ def test_transfer_topology_unregister():
         attn_backends=[FlashAttentionBackend],
     )
 
-    info = EngineTransferInfo(
-        remote_tp_size=1,
-        remote_block_size=16,
-        remote_block_len=64,
-        remote_physical_blocks_per_logical=1,
+    info = RemoteTransferInfo(
+        tp_size=1,
+        block_size=16,
+        block_len=64,
     )
     topo.register_remote_engine("remote-1", info)
     assert topo.get_engine_info("remote-1") is info
@@ -5008,12 +5059,12 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
         # / `dst_xfer_side_handles` to be keyed by remote rank.
         remote_engine_id = "remote_engine"
         worker.transfer_topo.register_remote_engine(
-            remote_engine_id=remote_engine_id,
-            remote_tp_size=prefill_tp_size,
-            remote_block_size=worker.block_size,
-            remote_block_len=worker.block_size * 4096,
-            remote_physical_blocks_per_logical=1,
-            local_block_len=worker.block_size * 4096,
+            remote_engine_id,
+            RemoteTransferInfo(
+                tp_size=prefill_tp_size,
+                block_size=worker.block_size,
+                block_len=worker.block_size * 4096,
+            ),
         )
         worker._remote_agents[remote_engine_id] = {
             (0, rank): f"agent_p{rank}" for rank in range(prefill_tp_size)

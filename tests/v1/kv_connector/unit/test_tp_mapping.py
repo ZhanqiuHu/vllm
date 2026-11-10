@@ -31,8 +31,10 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    LocalTransferInfo,
     MambaSpec,
     MLAAttentionSpec,
+    RemoteTransferInfo,
 )
 
 # ======================================================================
@@ -80,6 +82,8 @@ def _worker(
     worker = object.__new__(NixlConnectorWorker)
     worker.transfer_tp_rank = tp_rank
     worker.transfer_tp_size = tp_size
+    worker.engine_id = "local-engine"
+    worker.block_size = 4
     worker.transfer_topo = TransferTopology(
         tp_rank=tp_rank,
         tp_size=tp_size,
@@ -95,6 +99,14 @@ def _worker(
         name: layer if isinstance(layer, KVCacheSpec) else _spec(layer, tp_size)
         for name, layer in layers.items()
     }
+    worker._group_specs = tuple(worker._layer_specs.values())
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="local-engine",
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        block_size=4,
+        dcp_size=dcp_size,
+    )
     worker.kv_cache_config = SimpleNamespace(
         transfer_group_index_by_layer={name: i for i, name in enumerate(layers)}
     )
@@ -145,10 +157,10 @@ def _remote_meta(worker: NixlConnectorWorker, remote_tp_size: int) -> NixlAgentM
         attn_backend_name="",
         physical_blocks_per_group=[1] * len(remote_specs),
         region_members=worker.region_members,
-        layer_num_kv_heads={
-            name: spec.num_kv_heads
+        peer_spec_fields_by_layer={
+            name: dict(spec.peer_handshake_fields())
             for name, spec in zip(worker._layer_specs, remote_specs, strict=True)
-            if isinstance(spec, AttentionSpec)
+            if spec.peer_handshake_fields()
         },
     )
 
@@ -164,8 +176,20 @@ def _map(
     num_layers = len(worker.region_members)
     pairs = region_pairs_by_index(num_layers, range(num_layers))
     worker._dst_pairs[_ENGINE] = pairs
+    meta = _remote_meta(worker, remote_tp_size)
+    # Mirror engine block_size_ratio: remote token page is local // ratio.
+    remote_page = meta.block_size // block_size_ratio
+    worker.transfer_topo.register_remote_engine(
+        _ENGINE,
+        RemoteTransferInfo(
+            tp_size=remote_tp_size,
+            block_size=remote_page,
+            block_len=meta.block_lens[0],
+            dcp_size=remote_dcp_size,
+        ),
+    )
     ranges = worker._tp_byte_ranges(
-        _remote_meta(worker, remote_tp_size),
+        meta,
         list(zip(pairs.local, pairs.group, pairs.remote)),
         remote_tp_size,
         remote_dcp_size,
@@ -303,6 +327,15 @@ def _prep(worker: NixlConnectorWorker, remote_tp_size: int) -> _DescLists:
     worker.dst_region_num_blocks = {_ENGINE: [8] * num_layers}
     worker.dst_region_mem_types = {_ENGINE: ["VRAM"] * num_layers}
     meta = _remote_meta(worker, remote_tp_size)
+    # Idempotent if `_map` already registered this peer.
+    worker.transfer_topo.register_remote_engine(
+        _ENGINE,
+        RemoteTransferInfo(
+            tp_size=remote_tp_size,
+            block_size=meta.block_size,
+            block_len=meta.block_lens[0],
+        ),
+    )
     for rank in range(remote_tp_size):
         worker._prep_descs(meta, rank, "remote-agent", 1)
     return worker.nixl_wrapper

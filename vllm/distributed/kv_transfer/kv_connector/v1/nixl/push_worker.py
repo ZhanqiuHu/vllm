@@ -172,8 +172,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         # D-side: track reqs waiting for P to push.
         for req_id, meta in metadata.reqs_to_recv.items():
-            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
-                meta.local_block_ids, self._physical_blocks_per_group
+            meta.local_physical_block_ids = self._transfer_unit_ids_from_specs(
+                meta.local_block_ids, self._group_specs
             )
             assert meta.remote is not None
             remote_engine_id = meta.remote.engine_id
@@ -482,8 +482,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         logical_local = self._as_grouped_block_ids(local_block_ids)
         logical_remote = self._as_grouped_block_ids(remote_block_ids)
-        physical_local = self._logical_to_kernel_block_ids(
-            logical_local, self._physical_blocks_per_group
+        physical_local = self._transfer_unit_ids_from_specs(
+            logical_local, self._group_specs
         )
 
         push_meta = ReqMeta(
@@ -530,8 +530,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Expand D's logical IDs using the ratio learned during the
         # NIXL handshake. ``meta`` is freshly built by
         # ``_do_start_push_kv`` so mutating it here is safe.
-        meta.remote.block_ids = self._logical_to_kernel_block_ids(
-            meta.remote.block_ids, self._remote_physical_blocks_per_group[engine_id]
+        meta.remote.block_ids = self._remote_transfer_unit_ids(
+            engine_id, meta.remote.block_ids
         )
         if not self._dst_pairs[engine_id].groups_match:
             raise NotImplementedError(
@@ -599,14 +599,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids = read_spec.remote_block_ids
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-        if block_size_ratio > 1:
-            local_block_ids, remote_block_ids = (
-                self._map_block_ids_for_block_size_ratio(
-                    local_block_ids, remote_block_ids, block_size_ratio
-                )
+        local = self._require_local_transfer_info()
+        if local.block_size != remote_info.block_size:
+            local_block_ids, remote_block_ids = self._map_block_ids(
+                local_block_ids, remote_block_ids, local, remote_info
             )
 
         notif_id = f"{remote_request_id}:{self.world_size}".encode()
@@ -621,8 +617,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         remote_block_ids, local_block_ids = self._apply_prefix_caching(
             decode_block_ids=remote_block_ids,
             prefill_block_ids=local_block_ids,
-            decode_physical_per_logical=remote_info.remote_physical_blocks_per_logical,
-            prefill_physical_per_logical=self._physical_blocks_per_logical_kv_block,
+            decode_physical_per_group=self._remote_physical_blocks_per_group[
+                dst_engine_id
+            ],
+            prefill_physical_per_group=self._physical_blocks_per_group,
         )
 
         local_block_ids = list(local_block_ids)
