@@ -2994,7 +2994,13 @@ class NixlBaseConnectorWorker:
         manager_block_ids: BlockIds,
         group_specs: Sequence[KVCacheSpec],
     ) -> BlockIds:
-        """Run each group's ``convert_manager_block_ids_to_transfer_unit_ids``."""
+        """Run each group's ``convert_manager_block_ids_to_transfer_unit_ids``.
+
+        Empty ``manager_block_ids`` (full local hit / notify-only) stays empty
+        even when ``group_specs`` is non-empty — there are no groups to convert.
+        """
+        if not manager_block_ids:
+            return []
         return [
             spec.convert_manager_block_ids_to_transfer_unit_ids(group)
             for spec, group in zip(group_specs, manager_block_ids, strict=True)

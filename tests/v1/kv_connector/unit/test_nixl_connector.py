@@ -78,6 +78,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVQuantMode,
+    LocalTransferInfo,
     MLAAttentionSpec,
     RemoteTransferInfo,
     compute_layer_kv_cache_shape_bytes,
@@ -583,6 +584,14 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
             attn_backends=self.attn_backends,
             tensor_shape=test_shape,
         )
+        # Tests that skip register_kv_caches still need the planning bag.
+        self._local_transfer_info = LocalTransferInfo(
+            engine_id=self.engine_id,
+            tp_size=self.world_size,
+            tp_rank=self.tp_rank,
+            block_size=self.block_size,
+            dcp_size=self.dcp_size,
+        )
 
         self.compat_hash = compute_nixl_compatibility_hash(
             self.vllm_config, self.backend_name
@@ -668,7 +677,7 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
                     },
                 ),
                 remote_tp_rank=remote_tp_rank,
-                tp_size=remote_tp_size,
+                remote_tp_size=remote_tp_size,
             )
             remote_agents[(0, remote_tp_rank)] = remote_agent_name
         # Handshake bypasses zmq, so report a zero clock offset to the peer.
@@ -1051,7 +1060,7 @@ class TestNixlHandshake:
         remote_agents, _ = worker._nixl_handshake(
             host="localhost",
             port=1234,
-            tp_size=4,
+            remote_tp_size=4,
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
         check_handshake(4)
@@ -1063,7 +1072,7 @@ class TestNixlHandshake:
         remote_agents, _ = worker._nixl_handshake(
             host="localhost",
             port=1234,
-            tp_size=6,
+            remote_tp_size=6,
             expected_engine_id=worker.REMOTE_ENGINE_ID,
         )
         check_handshake(6)
@@ -1411,6 +1420,14 @@ class TestNixlHandshake:
             region_num_blocks=None,
         )
         _advertise_one_layer_per_region(worker, meta)
+        worker.transfer_topo.register_remote_engine(
+            meta.engine_id,
+            RemoteTransferInfo(
+                tp_size=1,
+                block_size=meta.block_size,
+                block_len=meta.block_lens[0],
+            ),
+        )
 
         # TP 2 rank 1 reads the second half of the TP 1 rank's heads.
         regions = [(0, 0, 0)]
@@ -2481,7 +2498,28 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
     worker.region_mem_types = ["DRAM", "VRAM"]
     worker.nixl_memory_type = "VRAM"
     # Both regions move whole 10-byte blocks with remote rank 0.
-    worker._group_spec_types = (FullAttentionSpec,)
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    worker._group_specs = (fa, fa)
+    worker._group_spec_types = (FullAttentionSpec, FullAttentionSpec)
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="local", tp_size=1, tp_rank=0, block_size=16
+    )
+    worker.transfer_topo = TransferTopology(
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        engine_id="local",
+        is_mla=False,
+        is_mamba=False,
+        total_num_kv_heads=1,
+        attn_backends=[],
+    )
+    worker.transfer_topo.register_remote_engine(
+        "P",
+        RemoteTransferInfo(tp_size=1, block_size=16, block_len=10),
+    )
     worker._dst_pairs = {"P": region_pairs_by_index(2)}
     worker._byte_ranges = {"P": [{0: [(0, 0, 10)]}] * 2}
     worker._remote_block_splits = {}
@@ -2525,7 +2563,13 @@ def recv_worker():
         block_size=16, tp_size=1, block_len=0, dcp_size=1
     )
     worker._remote_physical_blocks_per_group = {}
-    worker._local_transfer_info = None
+    worker._local_transfer_info = LocalTransferInfo(
+        engine_id="local", tp_size=1, tp_rank=0, block_size=16
+    )
+    fa = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    worker._group_specs = (fa,)
     worker._physical_blocks_per_logical_kv_block = 1
     worker._physical_blocks_per_group = [1]
     worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
@@ -4863,14 +4907,14 @@ def test_compatibility_hash_validation(
                 decode_worker._nixl_handshake(
                     host="localhost",
                     port=1234,
-                    tp_size=1,
+                    remote_tp_size=1,
                     expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
                 )
         else:
             result, _ = decode_worker._nixl_handshake(
                 host="localhost",
                 port=1234,
-                tp_size=1,
+                remote_tp_size=1,
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
             # Verify handshake returned agent mapping
@@ -4965,7 +5009,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
             decode_worker._nixl_handshake(
                 host="localhost",
                 port=1234,
-                tp_size=1,
+                remote_tp_size=1,
                 expected_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
             )
 
