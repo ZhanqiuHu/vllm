@@ -63,6 +63,14 @@ def get_representative_spec_type(group: KVCacheGroup) -> type[KVCacheSpec]:
     return MambaSpec if issubclass(group.manager_cls, MambaManager) else AttentionSpec
 
 
+def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
+    return issubclass(spec_type, AttentionSpec)
+
+
+def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
+    return issubclass(spec_type, MambaSpec)
+
+
 # Trailing 8-hex randomization suffix appended by
 # ``input_processor.assign_request_id`` as ``-{random_uuid():.8}``.
 _RANDOM_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
