@@ -3,10 +3,10 @@
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import count
 from typing import TYPE_CHECKING, Any, Literal
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import torch
@@ -24,7 +24,11 @@ from vllm.config import (
 )
 from vllm.config.kv_transfer import KVCacheAccess
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.utils import contiguous_byte_ranges
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    contiguous_byte_ranges,
+    pair_shards,
+    serialize_layer_meta_tensors,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -34,6 +38,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (  # noqa
     ExampleConnector,
 )
+from vllm.model_executor.layers.mamba import mamba_utils
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.platforms import current_platform
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -48,12 +57,14 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ComponentSpec,
     KVCacheConfig,
     KVCacheGroup,
     KVCacheLayerConfig,
     KVCacheSpec,
     MambaSpec,
     ManagerConfig,
+    MultiComponentSpec,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -63,6 +74,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
         _RegionPairs,
+        _RemoteStage,
     )
 
 EOS_TOKEN_ID = 50256
@@ -825,9 +837,28 @@ def region_pairs_by_index(
         remote=regions,
         local=regions,
         group=list(groups) if groups is not None else [0] * num_regions,
-        remote_regions=regions,
-        partner=regions,
         groups_match=groups_match,
+    )
+
+
+def remote_stage(worker: Any, engine_id: str, pp_rank: int = 0) -> "_RemoteStage":
+    """The stage of a remote engine in `worker`, added empty if missing, for
+    fixtures to fill in what a handshake would."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _RemoteStage,
+    )
+
+    if not isinstance(getattr(worker, "_remote_stages", None), dict):
+        worker._remote_stages = {}
+    return worker._remote_stages.setdefault(engine_id, {}).setdefault(
+        pp_rank,
+        _RemoteStage(
+            pp_rank=pp_rank,
+            pairs=region_pairs_by_index(0),
+            layers=[],
+            region_num_blocks=[],
+            region_group_ids=[],
+        ),
     )
 
 
@@ -847,18 +878,23 @@ def transfer_kv(
     written exactly once."""
     dst_raw, dst_view = dst_cache
     written = 0
+    dst_views = dst_spec.slice_for_tp_transfer(dst_view)
     for src_rank, (src_raw, src_view) in enumerate(src_caches):
-        dst_slices = dst_spec.slice_for_tp_transfer(
-            dst_view, dst_tp, dst_rank, src_spec, src_tp, src_rank, receiving=True
+        src_views = src_spec.slice_for_tp_transfer(src_view)
+        ranges = contiguous_byte_ranges(
+            pair_shards(
+                dst_views, dst_tp, dst_rank, src_views, src_tp, receiving=True
+            ).get(src_rank, [])
         )
-        src_slices = src_spec.slice_for_tp_transfer(
-            src_view, src_tp, src_rank, dst_spec, dst_tp, dst_rank, receiving=False
+        sent = contiguous_byte_ranges(
+            pair_shards(
+                src_views, src_tp, src_rank, dst_views, dst_tp, receiving=False
+            ).get(dst_rank, [])
         )
-        assert len(src_slices) == len(dst_slices)
-        for src, dst in zip(src_slices, dst_slices):
-            for src_off, dst_off, size in contiguous_byte_ranges(src, dst):
-                dst_raw[dst_off : dst_off + size] = src_raw[src_off : src_off + size]
-                written += size
+        assert sorted(ranges) == sorted((dst, src, size) for src, dst, size in sent)
+        for dst_off, src_off, size in ranges:
+            dst_raw[dst_off : dst_off + size] = src_raw[src_off : src_off + size]
+            written += size
     assert written == dst_raw.numel()
 
 
@@ -869,3 +905,85 @@ def rank_kv_heads(tp_rank: int, tp_size: int, total_num_kv_heads: int) -> range:
         return range(tp_rank * per_rank, (tp_rank + 1) * per_rank)
     head = tp_rank * total_num_kv_heads // tp_size
     return range(head, head + 1)
+
+
+def _mamba_layer_spec(layer_cls: Any):
+    def build(*, conv_dim: int = 0, **kwargs) -> MambaSpec:
+        spec, layout = MambaSpec(**kwargs), "SD" if conv_dim else "DS"
+        with (
+            patch.object(MambaBase, "get_kv_cache_spec", return_value=spec),
+            patch.object(mamba_utils, "get_conv_state_layout", return_value=layout),
+        ):
+            return layer_cls.get_kv_cache_spec(MagicMock(spec=layer_cls), None)
+
+    return build
+
+
+# What a Mamba1, Mamba2 or GDN layer's `get_kv_cache_spec` makes of a
+# `MambaSpec(**kwargs)` page, with the conv state's `dim` at `conv_dim`: 0 for
+# (dim, state_len), 1 for (state_len, dim).
+mamba1_spec = _mamba_layer_spec(MambaMixer)
+mamba2_spec = _mamba_layer_spec(MambaMixer2)
+gdn_spec = _mamba_layer_spec(GatedDeltaNetAttention)
+
+
+def remote_layer_spec(
+    spec: KVCacheSpec,
+    tp_size: int,
+    remote_tp_size: int,
+    remote_num_kv_heads: int | None = None,
+) -> KVCacheSpec:
+    """`spec` of a rank at `tp_size`, as a rank at `remote_tp_size` of the
+    same model holds it, with `remote_num_kv_heads` KV heads if given."""
+    if isinstance(spec, AttentionSpec):
+        heads = remote_num_kv_heads or spec.num_kv_heads
+        slots = spec.num_head_slots and spec.num_head_slots * heads // spec.num_kv_heads
+        return replace(spec, num_kv_heads=heads, num_head_slots=slots)
+    if isinstance(spec, mamba_utils.ConvComponentSpec):
+        parts = ((name, size * tp_size // remote_tp_size) for name, size in spec.parts)
+        return replace(spec, parts=tuple(parts))
+    if isinstance(spec, MultiComponentSpec) and spec.component_specs:
+        components = tuple(
+            (name, remote_layer_spec(component, tp_size, remote_tp_size))
+            for name, component in spec.component_specs
+        )
+        return replace(spec, component_specs=components, page_size_padded=None)
+    if isinstance(spec, ComponentSpec):
+        return replace(spec, num_heads=spec.num_heads * tp_size // remote_tp_size)
+    return spec
+
+
+def fake_remote_layer_meta_tensors(worker, meta, regions, remote_tp_size: int) -> None:
+    """Give `meta` the views a remote would advertise, where it has none:
+    those of the same model at `remote_tp_size` in blocks of the remote's
+    size, with `worker._fake_remote_kv_heads` KV heads if set. A worker that
+    registered no caches gets its own views too."""
+    from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _is_ssm_spec,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+
+    tp_size = worker.transfer_tp_size
+    layout = KVCacheLayout[meta.kv_cache_layout].layer_view_order
+    # Remote blocks per block of ours.
+    ratio = 1
+    if isinstance(worker.transfer_topo, TransferTopology):
+        ratio = worker.transfer_topo.block_size_ratio(meta.block_size)
+    heads = getattr(worker, "_fake_remote_kv_heads", {}).get(meta.engine_id, {})
+    for local, group in regions:
+        name = worker.region_members[local][0]
+        own_spec = worker._layer_specs[name]
+        block_len = worker.block_len_per_layer[local]
+        if name not in worker._layer_views:
+            own = KVCacheLayout[worker.kv_cache_layout].layer_view_order
+            block = worker._transfer_block(own_spec, group, block_len, own)
+            worker._layer_views[name] = (own_spec.slice_for_tp_transfer(block), True)
+        spec = remote_layer_spec(own_spec, tp_size, remote_tp_size, heads.get(name))
+        if not _is_ssm_spec(worker._group_spec_types[group]):
+            spec = replace(spec, block_size=spec.block_size // ratio)
+            block_len //= ratio
+        block = worker._transfer_block(spec, group, block_len, layout)
+        meta.layer_meta_tensors.setdefault(
+            name, serialize_layer_meta_tensors(spec.slice_for_tp_transfer(block))
+        )

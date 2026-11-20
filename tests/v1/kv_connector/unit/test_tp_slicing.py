@@ -11,10 +11,13 @@ layouts.
 import pytest
 import torch
 
-from tests.v1.kv_connector.unit.utils import transfer_kv
-from vllm.v1.attention.backends.gdn_attn import GDNSpec
-from vllm.v1.attention.backends.mamba1_attn import Mamba1Spec
-from vllm.v1.attention.backends.mamba2_attn import Mamba2Spec
+from tests.v1.kv_connector.unit.utils import (
+    gdn_spec,
+    mamba1_spec,
+    mamba2_spec,
+    transfer_kv,
+)
+from vllm.distributed.kv_transfer.kv_connector.utils import pair_shards
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 pytestmark = pytest.mark.cpu_test
@@ -45,6 +48,21 @@ def _spec(total_heads: int, tp_size: int) -> AttentionSpec:
         head_size=HEAD_SIZE,
         dtype=torch.float32,
         max_tp_shards=total_heads,
+    )
+
+
+def _views(spec) -> dict[str, torch.Tensor]:
+    block = torch.empty(
+        NUM_BLOCKS, 1, 1, spec.page_size_bytes, dtype=torch.int8, device="meta"
+    )
+    return spec.slice_for_tp_transfer(block)
+
+
+def _reads(spec, cache, tp_size, tp_rank, src_spec, src_tp, src_rank) -> bool:
+    """Whether the rank reads any of `cache` from the source rank."""
+    views, src_views = (s.slice_for_tp_transfer(cache) for s in (spec, src_spec))
+    return src_rank in pair_shards(
+        views, tp_size, tp_rank, src_views, src_tp, receiving=True
     )
 
 
@@ -81,9 +99,7 @@ def test_receivers_spread_reads_across_replicas():
         [
             p_rank
             for p_rank in range(8)
-            if d_spec.slice_for_tp_transfer(
-                cache, 4, d_rank, p_spec, 8, p_rank, receiving=True
-            )
+            if _reads(d_spec, cache, 4, d_rank, p_spec, 8, p_rank)
         ]
         for d_rank in range(4)
     ]
@@ -101,9 +117,7 @@ def test_replicated_heads_read_one_replica():
         [
             p_rank
             for p_rank in range(2)
-            if spec.slice_for_tp_transfer(
-                cache, 4, d_rank, spec, 2, p_rank, receiving=True
-            )
+            if _reads(spec, cache, 4, d_rank, spec, 2, p_rank)
         ]
         for d_rank in range(4)
     ]
@@ -124,24 +138,22 @@ def test_custom_head_slots_transfer_only_whole_pages():
         )
 
     cache = torch.empty(NUM_BLOCKS, 2, BLOCK_SIZE, 4 * HEAD_SIZE, device="meta")
-    slices = spec(4).slice_for_tp_transfer(cache, 1, 0, spec(4), 1, 0, receiving=True)
-    assert slices == [cache]
-    with pytest.raises(NotImplementedError):
-        spec(4).slice_for_tp_transfer(cache, 1, 0, spec(2), 2, 0, receiving=True)
+    (view,) = spec(4).slice_for_tp_transfer(cache).values()
+    assert view.shape[1] == 1 and view.numel() == cache.numel()
 
 
 CONV_ROWS = 3
 # Per Mamba spec: the global conv sub-projection sizes, each sharded across TP,
 # and the global temporal state shape, sharded along its first dim.
 MAMBA_LAYOUTS = {
-    Mamba1Spec: ((16,), (16, 4)),
-    Mamba2Spec: ((16, 8, 8), (8, 2, 4)),
-    GDNSpec: ((8, 8, 16), (8, 2, 4)),
+    mamba1_spec: ((16,), (16, 4)),
+    mamba2_spec: ((16, 8, 8), (8, 2, 4)),
+    gdn_spec: ((8, 8, 16), (8, 2, 4)),
 }
 
 
 def _make_mamba_page(
-    spec_cls: type[MambaSpec],
+    spec_cls,
     conv: list[torch.Tensor],
     temporal: torch.Tensor,
     tp_size: int,
@@ -203,167 +215,82 @@ def test_hetero_tp_transfer_assembles_decode_mamba_state(p_tp, d_tp, spec_cls):
 
 def test_mamba_spec_without_tp_layout_transfers_only_whole_pages():
     """A plain MambaSpec does not know how its states shard."""
-    spec = MambaSpec(
-        block_size=BLOCK_SIZE, shapes=((8, 3), (8, 4)), dtypes=(torch.float32,) * 2
-    )
-    block = torch.empty(NUM_BLOCKS, 1, 1, spec.page_size_bytes, device="meta")
-    assert spec.slice_for_tp_transfer(block, 2, 1, spec, 2, 1, receiving=True) == [
-        block
-    ]
+
+    def views(dim: int) -> dict[str, torch.Tensor]:
+        shapes = ((dim, 3), (dim, 4))
+        return _views(
+            MambaSpec(block_size=BLOCK_SIZE, shapes=shapes, dtypes=(torch.float32,) * 2)
+        )
+
+    assert [v.numel() // NUM_BLOCKS for v in views(8).values()] == [96, 128]
     with pytest.raises(NotImplementedError):
-        spec.slice_for_tp_transfer(block, 2, 0, spec, 1, 0, receiving=True)
+        pair_shards(views(8), 2, 0, views(16), 1, receiving=True)
 
 
 def test_mamba2_replicated_groups_fail_closed():
     """With fewer groups than ranks, B and C are replicated rather than sharded,
     so they cannot be resliced by TP."""
     # One group of 8: TP1 holds it once, each TP2 rank holds a copy.
-    tp1 = Mamba2Spec(
+    tp1 = mamba2_spec(
         block_size=BLOCK_SIZE,
         shapes=((16 + 2 * 8, 3), (8, 2, 4)),
         dtypes=(torch.float16, torch.float32),
     )
-    tp2 = Mamba2Spec(
+    tp2 = mamba2_spec(
         block_size=BLOCK_SIZE,
         shapes=((8 + 2 * 8, 3), (4, 2, 4)),
         dtypes=(torch.float16, torch.float32),
     )
-    block = torch.empty(NUM_BLOCKS, 1, 1, tp2.page_size_bytes, device="meta")
-    with pytest.raises(NotImplementedError, match="does not shard evenly"):
-        tp2.slice_for_tp_transfer(block, 2, 0, tp1, 1, 0, receiving=True)
+    with pytest.raises(NotImplementedError, match="do not shard this layer"):
+        pair_shards(_views(tp2), 2, 0, _views(tp1), 1, receiving=True)
+
+
+# Real models' states on one rank: (layer spec, conv dim, temporal state shape,
+# the sizes of the sub-projections the conv state is made of).
+REAL_MODEL_STATES = {
+    # nvidia/Nemotron-H-8B-Base-8K (Mamba2)
+    # mamba_num_heads=128, head_dim=64, n_groups=8, ssm_state_size=128
+    "nemotron_h_8b_tp1": (mamba2_spec, 10240, (128, 64, 128), (8192, 1024, 1024)),
+    "nemotron_h_8b_tp4": (mamba2_spec, 2560, (32, 64, 128), (2048, 256, 256)),
+    # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B (Mamba2)
+    # mamba_num_heads=64, head_dim=64, n_groups=8, ssm_state_size=128
+    "nemotron_nano_30b_tp1": (mamba2_spec, 6144, (64, 64, 128), (4096, 1024, 1024)),
+    # Qwen/Qwen3.5-0.8B (GDN, symmetric: num_v=num_k=16)
+    # key_dim=2048, value_dim=2048, conv_dim=6144
+    "qwen35_08b_tp1": (gdn_spec, 6144, (16, 128, 128), (2048, 2048, 2048)),
+    "qwen35_08b_tp4": (gdn_spec, 1536, (4, 128, 128), (512, 512, 512)),
+    # Qwen/Qwen3.5-4B (GDN, asymmetric: num_v=32, num_k=16, K:V=1:2)
+    # key_dim=2048, value_dim=4096, conv_dim=8192
+    "qwen35_4b_tp1": (gdn_spec, 8192, (32, 128, 128), (2048, 2048, 4096)),
+    # Qwen/Qwen3.5-27B (GDN, asymmetric: num_v=48, num_k=16, K:V=1:3)
+    # key_dim=2048, value_dim=6144, conv_dim=10240
+    "qwen35_27b_tp1": (gdn_spec, 10240, (48, 128, 128), (2048, 2048, 6144)),
+    "qwen35_27b_tp8": (gdn_spec, 1280, (6, 128, 128), (256, 256, 768)),
+    # ai21labs/AI21-Jamba2-Mini (Mamba1)
+    # mamba d_inner = mamba_expand(2) * hidden_size(4096) = 8192
+    # mamba_d_state=16, mamba_d_conv=4 → conv_rows=3.
+    # Conv state holds only x: a single contiguous sub-projection.
+    "jamba_mini_tp1": (mamba1_spec, 8192, (8192, 16), (8192,)),
+    "jamba_mini_tp4": (mamba1_spec, 2048, (2048, 16), (2048,)),
+    "jamba_mini_tp8": (mamba1_spec, 1024, (1024, 16), (1024,)),
+}
 
 
 @pytest.mark.parametrize(
-    "mamba_type,local_tp,conv_dim_local,conv_rows,temporal_shape,expected_proj_dims",
-    [
-        # nvidia/Nemotron-H-8B-Base-8K (Mamba2)
-        # mamba_num_heads=128, head_dim=64, n_groups=8, ssm_state_size=128
-        pytest.param(
-            "mamba2",
-            1,
-            10240,
-            3,
-            (128, 64, 128),
-            (8192, 1024, 1024),
-            id="nemotron_h_8b_tp1",
-        ),
-        pytest.param(
-            "mamba2",
-            4,
-            2560,
-            3,
-            (32, 64, 128),
-            (2048, 256, 256),
-            id="nemotron_h_8b_tp4",
-        ),
-        # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B (Mamba2)
-        # mamba_num_heads=64, head_dim=64, n_groups=8, ssm_state_size=128
-        pytest.param(
-            "mamba2",
-            1,
-            6144,
-            3,
-            (64, 64, 128),
-            (4096, 1024, 1024),
-            id="nemotron_nano_30b_tp1",
-        ),
-        # Qwen/Qwen3.5-0.8B (GDN, symmetric: num_v=num_k=16)
-        # key_dim=2048, value_dim=2048, conv_dim=6144
-        pytest.param(
-            "gdn_attention",
-            1,
-            6144,
-            3,
-            (16, 128, 128),
-            (2048, 2048, 2048),
-            id="qwen35_08b_tp1",
-        ),
-        pytest.param(
-            "gdn_attention",
-            4,
-            1536,
-            3,
-            (4, 128, 128),
-            (512, 512, 512),
-            id="qwen35_08b_tp4",
-        ),
-        # Qwen/Qwen3.5-4B (GDN, asymmetric: num_v=32, num_k=16, K:V=1:2)
-        # key_dim=2048, value_dim=4096, conv_dim=8192
-        pytest.param(
-            "gdn_attention",
-            1,
-            8192,
-            3,
-            (32, 128, 128),
-            (2048, 2048, 4096),
-            id="qwen35_4b_tp1",
-        ),
-        # Qwen/Qwen3.5-27B (GDN, asymmetric: num_v=48, num_k=16, K:V=1:3)
-        # key_dim=2048, value_dim=6144, conv_dim=10240
-        pytest.param(
-            "gdn_attention",
-            1,
-            10240,
-            3,
-            (48, 128, 128),
-            (2048, 2048, 6144),
-            id="qwen35_27b_tp1",
-        ),
-        pytest.param(
-            "gdn_attention",
-            8,
-            1280,
-            3,
-            (6, 128, 128),
-            (256, 256, 768),
-            id="qwen35_27b_tp8",
-        ),
-        # ai21labs/AI21-Jamba2-Mini (Mamba1)
-        # mamba d_inner = mamba_expand(2) * hidden_size(4096) = 8192
-        # mamba_d_state=16, mamba_d_conv=4 → conv_rows=3.
-        # Conv state holds only x: a single contiguous sub-projection.
-        pytest.param(
-            "mamba1",
-            1,
-            8192,
-            3,
-            (8192, 16),
-            (8192,),
-            id="jamba_mini_tp1",
-        ),
-        pytest.param(
-            "mamba1",
-            4,
-            2048,
-            3,
-            (2048, 16),
-            (2048,),
-            id="jamba_mini_tp4",
-        ),
-        pytest.param(
-            "mamba1",
-            8,
-            1024,
-            3,
-            (1024, 16),
-            (1024,),
-            id="jamba_mini_tp8",
-        ),
-    ],
+    "spec_cls,conv_dim_local,temporal_shape,expected_proj_dims",
+    list(REAL_MODEL_STATES.values()),
+    ids=list(REAL_MODEL_STATES),
 )
 def test_mamba_specs_split_real_model_conv_states(
-    mamba_type, local_tp, conv_dim_local, conv_rows, temporal_shape, expected_proj_dims
+    spec_cls, conv_dim_local, temporal_shape, expected_proj_dims
 ):
-    """Backend specs cut real models' conv states into their sub-projections."""
-    spec_cls = {"mamba1": Mamba1Spec, "mamba2": Mamba2Spec, "gdn_attention": GDNSpec}
-    spec = spec_cls[mamba_type](
+    """The layers' specs cut real models' conv states into their sub-projections."""
+    spec = spec_cls(
         block_size=64,
-        shapes=((conv_dim_local, conv_rows), temporal_shape),
+        shapes=((conv_dim_local, CONV_ROWS), temporal_shape),
         dtypes=(torch.bfloat16, torch.bfloat16),
     )
     block = torch.empty(1, 1, 1, spec.page_size_bytes, dtype=torch.int8, device="meta")
-    views = spec.slice_for_tp_transfer(
-        block, local_tp, 0, spec, local_tp, 0, receiving=True
-    )
-    conv_ranges = [view.numel() // (conv_rows * 2) for view in views[:-1]]
+    views = list(spec.slice_for_tp_transfer(block).values())
+    conv_ranges = [view.numel() // (CONV_ROWS * 2) for view in views[:-1]]
     assert conv_ranges == list(expected_proj_dims)

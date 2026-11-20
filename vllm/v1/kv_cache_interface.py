@@ -199,6 +199,15 @@ class KVCacheSpec:
     `MultipleOf(n)`: whole kernel blocks, when blocks are split into kernel
     blocks of up to `n` tokens."""
 
+    tokens_per_state: int | Fraction = field(default=-1, kw_only=True)
+    """Tokens covered by one stored state. Ints > 1 compress multiple tokens
+    into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
+    token (Whisper block pooling: `Fraction(1, block_pool_size)`). Not
+    positive: the states do not follow the tokens of a block."""
+
+    page_size_padded: int | None = field(default=None, kw_only=True)
+    """The page size in bytes, if larger than its content."""
+
     def __post_init__(self):
         alignment = self.block_stride_alignment
         if isinstance(alignment, int) and alignment <= 0:
@@ -221,22 +230,27 @@ class KVCacheSpec:
         raise NotImplementedError
 
     @property
-    def tokens_per_state(self) -> int | Fraction:
-        raise NotImplementedError
-
-    @property
     def state_content_size_bytes(self) -> int:
         raise NotImplementedError
 
     @property
+    def unpadded_page_size_bytes(self) -> int:
+        return self.num_heads * self.num_states * self.state_content_size_bytes
+
+    @property
     def page_size_bytes(self) -> int:
-        """The size of a page with `block_size` tokens in bytes.
+        """The size of a page with `block_size` tokens in bytes."""
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= self.unpadded_page_size_bytes
+            return self.page_size_padded
+        return self.unpadded_page_size_bytes
 
-        Returns:
-            The page size
-
+    @property
+    def real_page_size_bytes(self) -> int:
+        """Alias of `unpadded_page_size_bytes`
+        TODO(lucas): follow up with TPU backend to see if we can remove this property.
         """
-        raise NotImplementedError
+        return self.unpadded_page_size_bytes
 
     @property
     def num_states(self) -> int:
@@ -267,33 +281,119 @@ class KVCacheSpec:
         """
         return True
 
-    def slice_for_tp_transfer(
-        self,
-        cache: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        other_spec: KVCacheSpec,
-        other_tp_size: int,
-        other_tp_rank: int,
-        *,
-        receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Views of `cache` moved between this rank and another TP rank.
+    def slice_for_tp_transfer(self, cache: torch.Tensor) -> dict[str, torch.Tensor]:
+        """The parts of `cache` that are sharded across TP, by component name
+        (`""` for a spec without components).
 
-        `cache` is this rank's page view of one layer (layout is type-specific;
-        see overrides), real or on the meta device. The other rank's call,
-        given this rank as its peer and the opposite `receiving`, returns views
-        of the same shapes in the same order, so the two lists pair up for
-        transfer. Empty when the pair moves nothing, so the other rank is not
-        a source (or destination) of this one.
+        `cache` is a rank's `[B, H, N, C]` page view of one layer, real or on
+        the meta device. Dim 1 of each returned view is what TP shards: a rank
+        holds a contiguous run of it, or a copy of all of it. Two ranks of
+        different TP sizes each cut their own views into shards and pair them
+        with `pair_shards`.
         """
-        if tp_size == other_tp_size and tp_rank == other_tp_rank:
-            return [cache]
-        if tp_size == other_tp_size:
-            return []
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support heterogeneous TP transfers."
+        return {"": cache}
+
+
+@dataclass(frozen=True, kw_only=True)
+class ComponentSpec(KVCacheSpec):
+    """A `[H, N, C]` block of bytes, sharded across TP by head: a rank holds a
+    contiguous run of the heads of all ranks, or a copy of the one head."""
+
+    num_heads: int = 1
+    num_kernel_states: int = 1
+    state_content_bytes: int
+
+    def get_num_kernel_states(self, kernel_block_size: int) -> int:
+        return self.num_kernel_states
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return self.state_content_bytes
+
+
+@dataclass(frozen=True)
+class MultiComponentSpec(KVCacheSpec):
+    """A page made of named components, each with its own spec.
+
+    Planning and allocation see one page. `split` views its components, and
+    TP transfers slice each component with its own spec. The components are
+    back to back in the page: each is its own `[H, N, C]`, stored as the page
+    stores its heads and states and aligned to `component_alignment`. For
+    components K and V of a page with two states:
+
+        | K state 0 | K state 1 | V state 0 | V state 1 |
+
+    A subclass that packs its components another way overrides `split`.
+    """
+
+    component_specs: tuple[tuple[str, KVCacheSpec], ...] = field(
+        default=(), kw_only=True
+    )
+    """The named components, unless a subclass derives `components`."""
+
+    @property
+    def components(self) -> dict[str, KVCacheSpec]:
+        return dict(self.component_specs)
+
+    @property
+    def component_alignment(self) -> int:
+        """Byte alignment of each component within the page."""
+        return 1
+
+    @property
+    def num_heads(self) -> int:
+        return 1
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return sum(
+            round_up(
+                spec.num_heads * spec.num_states * spec.state_content_size_bytes,
+                self.component_alignment,
+            )
+            for spec in self.components.values()
         )
+
+    def split(self, cache: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Byte `[B, H, N, C]` views of the components of `cache`, a byte
+        `[B, H, N, C]` page view of this spec."""
+        assert cache.element_size() == 1, "split takes a byte page view"
+        num_blocks, _, page_states, _ = cache.shape
+        block_stride, head_stride, state_stride, _ = cache.stride()
+        tokens = (
+            page_states * self.tokens_per_state
+            if self.tokens_per_state > 0
+            else self.block_size
+        )
+        # Each component is a dense `[H, N, C]` at its offset in every block,
+        # with its heads and states in the order the page stores its own.
+        layout = (
+            KVCacheLayout.LBHNC if head_stride >= state_stride else KVCacheLayout.LBNHC
+        )
+        views = {}
+        offset = cache.storage_offset()
+        for name, spec in self.components.items():
+            _, heads, states, content = compute_layer_kv_cache_shape_bytes(
+                spec, 1, tokens
+            )
+            _, *strides = compute_layout_strides(
+                spec, 1, 1, layout, tokens, (None, block_stride, None, None, None)
+            )
+            views[name] = view = cache.as_strided(
+                (num_blocks, heads, states, content), strides, offset
+            )
+            offset += round_up(view[0].numel(), self.component_alignment)
+        return views
+
+    def slice_for_tp_transfer(self, cache: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Each component's views, sliced by its own spec."""
+        return {
+            f"{name}/{sub}".rstrip("/"): view
+            for (name, spec), part in zip(
+                self.components.items(), self.split(cache).values(), strict=True
+            )
+            for sub, view in spec.slice_for_tp_transfer(part).items()
+        }
 
 
 def get_block_table_width(
@@ -491,7 +591,6 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     head_size_v: int = None  # type: ignore[assignment]
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
-    page_size_padded: int | None = None
     num_head_slots: int | None = None
     """H of the logical `[B, H, N, C]` page when packing diverges from one
     slot per KV head. None means one slot per KV head. Published by the backend.
@@ -503,9 +602,6 @@ class AttentionSpec(KVCacheSpec):
     `h`'s K and V slots are adjacent), so every KV head is one contiguous run
     of the page and the page re-shards across TP by byte offset."""
     tokens_per_state: int | Fraction = 1
-    """Tokens covered by one stored state. Ints > 1 compress multiple tokens
-    into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
-    token (Whisper block pooling: `Fraction(1, block_pool_size)`)."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -520,48 +616,16 @@ class AttentionSpec(KVCacheSpec):
 
     # NOTE: KV-head placement across TP belongs to a GQA spec subclass; it
     # moves there (or goes away) with the spec split of RFC #42449 (#61452).
-    def slice_for_tp_transfer(
-        self,
-        cache: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        other_spec: KVCacheSpec,
-        other_tp_size: int,
-        other_tp_rank: int,
-        *,
-        receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Narrow `cache` to the KV heads moved between the two ranks.
+    def slice_for_tp_transfer(self, cache: torch.Tensor) -> dict[str, torch.Tensor]:
+        """`cache` itself: its dim 1, the KV heads, is what TP shards.
 
         `cache` is this rank's `[B, H, N, C]` (or head-slot) layer view. A
-        cache whose dim 1 is not its KV heads (custom `num_head_slots`)
-        moves whole.
+        cache whose dim 1 is not its KV heads (custom `num_head_slots`) is not
+        cut: its view gets a dim 1 of one.
         """
-        assert isinstance(other_spec, AttentionSpec)
-        n, other_n = self.num_kv_heads, other_spec.num_kv_heads
-        heads, other_heads = tp_size * n, other_tp_size * other_n
-        # Number each side's heads across all its ranks (a replicated head
-        # counts on every rank); a receiving head reads the sending head at
-        # the same position. Pairs are (our head, their head).
-        if receiving:
-            pairs = [(h, h * other_heads // heads) for h in range(heads)]
-        else:
-            pairs = [(h * heads // other_heads, h) for h in range(other_heads)]
-        moved = [
-            ours % n
-            for ours, theirs in pairs
-            if ours // n == tp_rank and theirs // other_n == other_tp_rank
-        ]
-        if not moved:
-            return []
-        if cache.shape[1] == self.num_kv_heads:
-            return [cache[:, moved[0] : moved[-1] + 1]]
-        if self.num_kv_heads == other_spec.num_kv_heads:
-            return [cache]
-        raise NotImplementedError(
-            f"{type(self).__name__} with {self.num_head_slots} head slots cannot "
-            "be sliced by KV head."
-        )
+        if cache.shape[1] != self.num_kv_heads:
+            cache = cache.unsqueeze(1)
+        return {"": cache}
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -569,24 +633,6 @@ class AttentionSpec(KVCacheSpec):
         if self.state_content_bytes is not None:
             return self.state_content_bytes
         return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
-
-    @property
-    def unpadded_page_size_bytes(self) -> int:
-        return self.num_heads * self.num_states * self.state_content_size_bytes
-
-    @property
-    def page_size_bytes(self) -> int:
-        if self.page_size_padded is not None:
-            assert self.page_size_padded >= self.unpadded_page_size_bytes
-            return self.page_size_padded
-        return self.unpadded_page_size_bytes
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        """Alias of `unpadded_page_size_bytes`
-        TODO(lucas): follow up with TPU backend to see if we can remove this property.
-        """
-        return self.unpadded_page_size_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -619,15 +665,12 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
 
 
 @dataclass(frozen=True)
-class MambaSpec(KVCacheSpec):
+class MambaSpec(MultiComponentSpec):
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype, ...]
     state_alignment: int = 1
     """Byte alignment of each state within a page."""
-    page_size_padded: int | None = None
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
-    num_heads: int = 1
-    tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
@@ -640,92 +683,30 @@ class MambaSpec(KVCacheSpec):
             )
 
     @property
-    def state_content_size_bytes(self) -> int:
-        return sum(
-            round_up(prod(shape) * get_dtype_size(dtype), self.state_alignment)
-            for (shape, dtype) in zip(self.shapes, self.dtypes)
+    def component_alignment(self) -> int:
+        return self.state_alignment
+
+    @property
+    def components(self) -> dict[str, KVCacheSpec]:
+        """The states (e.g. conv, temporal) as the layer declared them, or
+        else each whole, by index: sharded across TP in a way unknown here."""
+        return super().components or {
+            str(i): ComponentSpec(
+                block_size=self.block_size,
+                state_content_bytes=prod(shape) * get_dtype_size(dtype),
+            )
+            for i, (shape, dtype) in enumerate(zip(self.shapes, self.dtypes))
+        }
+
+    def split_states(self, cache: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """`[B, *shape]` views of the states (e.g. conv, temporal) of `cache`,
+        a byte `[B, 1, 1, C]` page view of this spec."""
+        return tuple(
+            view.view(len(view), -1).view(dtype).view(-1, *shape)
+            for view, shape, dtype in zip(
+                self.split(cache).values(), self.shapes, self.dtypes, strict=True
+            )
         )
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        return self.state_content_size_bytes
-
-    @property
-    def page_size_bytes(self) -> int:
-        page_size = self.state_content_size_bytes
-        if self.page_size_padded is not None:
-            assert self.page_size_padded >= page_size
-            return self.page_size_padded
-        return page_size
-
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...] | None:
-        """Per state, the local sizes of the consecutive leading-dim segments
-        that are each sharded evenly across TP. None if unknown, so only
-        same-TP transfers are supported. Mamba backends override this."""
-        return None
-
-    def slice_for_tp_transfer(
-        self,
-        cache: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        other_spec: KVCacheSpec,
-        other_tp_size: int,
-        other_tp_rank: int,
-        *,
-        receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Narrow each sharded segment of each state to the rows both ranks hold.
-
-        `cache` is the layer's `[B, 1, 1, C]` int8 page view (see
-        `MambaBase.bind_kv_cache`); one view is returned per shared segment.
-        """
-        assert isinstance(other_spec, MambaSpec)
-        if self.tp_replicated:
-            # Every rank holds the whole state; a receiver takes it from the
-            # sender at its position.
-            if receiving:
-                source = tp_rank * other_tp_size // tp_size
-                return [cache] if other_tp_rank == source else []
-            return (
-                [cache] if tp_rank == other_tp_rank * tp_size // other_tp_size else []
-            )
-        segments = self._tp_segments()
-        other_segments = other_spec._tp_segments()
-        if segments is None or other_segments is None:
-            return super().slice_for_tp_transfer(
-                cache,
-                tp_size,
-                tp_rank,
-                other_spec,
-                other_tp_size,
-                other_tp_rank,
-                receiving=receiving,
-            )
-        pages = cache.flatten(1)
-        views: list[torch.Tensor] = []
-        offset = 0
-        for shape, dtype, sizes, other_sizes in zip(
-            self.shapes, self.dtypes, segments, other_segments, strict=True
-        ):
-            row_bytes = prod(shape[1:]) * get_dtype_size(dtype)
-            state_bytes = prod(shape) * get_dtype_size(dtype)
-            seg_offset = offset
-            for size, other_size in zip(sizes, other_sizes, strict=True):
-                if size * tp_size != other_size * other_tp_size:
-                    raise NotImplementedError(
-                        f"{type(self).__name__} segment of {size} rows at TP "
-                        f"{tp_size} does not shard evenly with {other_size} "
-                        f"rows at TP {other_tp_size}."
-                    )
-                start = max(tp_rank * size, other_tp_rank * other_size)
-                stop = min((tp_rank + 1) * size, (other_tp_rank + 1) * other_size)
-                if start < stop:
-                    first = seg_offset + (start - tp_rank * size) * row_bytes
-                    views.append(pages[:, first : first + (stop - start) * row_bytes])
-                seg_offset += size * row_bytes
-            offset += round_up(state_bytes, self.state_alignment)
-        return views
 
 
 def get_mamba_prefill_checkpoint_position(
